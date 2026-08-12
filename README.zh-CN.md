@@ -441,3 +441,7 @@ make swagger
 - [English README](./README.md)
 - [后端说明](./backend/README.md)
 - [前端说明](./frontend/README.md)
+- [AI 代理运维入口](./AGENTS.md)
+- [Quality Guard 参考](./docs/QUALITY_GUARD.md)
+- [出口拓扑与安全边界](./docs/EGRESS.md)
+- [本地部署差异](./docs/LOCAL_PATCHES.md)
