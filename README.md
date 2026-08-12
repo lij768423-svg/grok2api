@@ -450,4 +450,5 @@ make swagger
 - [AI agent operations guide](./AGENTS.md)
 - [Quality Guard reference](./docs/QUALITY_GUARD.md)
 - [Egress topology and safety boundaries](./docs/EGRESS.md)
+- [Recommended residential/Resin and Mihomo deployment](./docs/RECOMMENDED_DEPLOYMENT.md)
 - [Local deployment differences](./docs/LOCAL_PATCHES.md)

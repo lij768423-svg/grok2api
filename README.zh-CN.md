@@ -444,4 +444,5 @@ make swagger
 - [AI 代理运维入口](./AGENTS.md)
 - [Quality Guard 参考](./docs/QUALITY_GUARD.md)
 - [出口拓扑与安全边界](./docs/EGRESS.md)
+- [家宽/Resin 与 Mihomo 推荐部署](./docs/RECOMMENDED_DEPLOYMENT.md)
 - [本地部署差异](./docs/LOCAL_PATCHES.md)

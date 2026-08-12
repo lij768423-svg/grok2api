@@ -13,9 +13,11 @@ rotation, or TTFT account ranking, read these files in order:
 1. `docs/QUALITY_GUARD.md` - authoritative implementation and operations reference
    for the deployed sidecar.
 2. `docs/EGRESS.md` - egress topology and proxy-chain context.
-3. `docs/LOCAL_PATCHES.md` - local behavior relative to upstream Grok2API.
-4. `docker-compose.yml` and `config.yaml` - declared deployment configuration.
-5. `tools/egress-quality-guard/quality_guard.py` - final source of truth for
+3. `docs/RECOMMENDED_DEPLOYMENT.md` - recommended residential/Resin to Mihomo
+   to Grok2API/Guard deployment flow.
+4. `docs/LOCAL_PATCHES.md` - local behavior relative to upstream Grok2API.
+5. `docker-compose.yml` and `config.yaml` - declared deployment configuration.
+6. `tools/egress-quality-guard/quality_guard.py` - final source of truth for
    behavior when documentation and implementation disagree.
 
 Values labelled as production snapshots in documentation are historical. Read
