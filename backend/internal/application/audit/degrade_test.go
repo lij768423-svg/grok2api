@@ -13,6 +13,19 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 )
 
+func TestDegradeSevenDaySeriesUsesBoundedBuckets(t *testing.T) {
+	end := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	specs := degradeBucketSpecs(degradeWindow7d, end.Add(-7*24*time.Hour), end)
+	if len(specs) != 42 {
+		t.Fatalf("7d bucket count = %d, want 42", len(specs))
+	}
+	for index, spec := range specs {
+		if got := spec.Range.End.Sub(spec.Range.Start); got != 4*time.Hour && index != len(specs)-1 {
+			t.Fatalf("bucket %d duration = %s, want 4h", index, got)
+		}
+	}
+}
+
 func TestDegradeSummaryClassifiesStreamingAnomalies(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "degrade.db"))

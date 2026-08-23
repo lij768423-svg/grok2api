@@ -43,6 +43,9 @@ const clearanceCacheCleanupInterval = time.Minute
 const clearanceCacheMinIdleTTL = 30 * time.Minute
 const maxCachedClearances = 16384
 const clearanceCacheEvictionBatch = 256
+const maxConcurrentClearanceSolves = 4
+const clearanceNoChallengeCooldown = 2 * time.Minute
+const clearanceSolveFailureCooldown = 30 * time.Second
 
 // clientClosedRequestStatus is the conventional proxy status for a client-aborted request.
 const clientClosedRequestStatus = 499
@@ -115,7 +118,11 @@ func (l *Lease) doRequest(request *http.Request, invalidateForbidden bool) (*htt
 	}
 	response, err := l.do(request)
 	recordPhysicalCall(request.Context(), response, err)
-	if invalidateForbidden && err == nil && response != nil && response.StatusCode == http.StatusForbidden {
+	// A generic 403 is commonly an application/account response. Only the
+	// documented Cloudflare challenge header is safe to act on before the body
+	// has been classified; body-based challenge detection remains the caller's
+	// responsibility (see DoDeferredForbidden).
+	if invalidateForbidden && err == nil && response != nil && response.StatusCode == http.StatusForbidden && hasCloudflareChallengeHeader(response.Header) {
 		l.InvalidateClearance()
 	}
 	return response, err
@@ -164,6 +171,8 @@ type Manager struct {
 	failureProbes          map[uint64]failureProbeState
 	lastClientCleanup      time.Time
 	clearanceLoads         singleflight.Group
+	clearanceSolverOnce    sync.Once
+	clearanceSolverSlots   chan struct{}
 	clearanceConfig        ClearanceConfig
 	clearanceVersion       uint64
 	clearances             map[string]clearanceState
@@ -185,6 +194,7 @@ type clearanceState struct {
 	fingerprint        string
 	bindingFingerprint string
 	lastUsedAt         time.Time
+	solveBackoffUntil  time.Time
 }
 
 type egressStateRepository interface {
@@ -463,11 +473,10 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 	if identity == "" {
 		identity = string(credential.Provider) + "_" + strconv.FormatUint(credential.ID, 10)
 	}
-	// Web and Console accounts can be two database projections of the same SSO
-	// login. Resin must see one stable account identity across both channels;
-	// otherwise the proxy rotates the IP while the clearance remains bound to
-	// the other lease. The digest is non-reversible and is only used as a proxy
-	// template account label.
+	// The digest is non-reversible and is only used as a proxy template account
+	// label. Channel scoping below is applied after this fallback identity is
+	// derived so linked Web/Console records still map to the same logical login
+	// without sharing a browser session.
 	if strings.TrimSpace(credential.EgressIdentity) == "" && credential.AuthType == accountdomain.AuthTypeSSO && strings.TrimSpace(credential.EncryptedAccessToken) != "" {
 		token, decryptErr := m.cipher.Decrypt(credential.EncryptedAccessToken)
 		if decryptErr != nil {
@@ -475,10 +484,26 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 		}
 		identity = "sso_" + security.HashToken(token)[:32]
 	}
+	// Web and Console may fall back to the same physical Resin template node,
+	// but their browser sessions and Cloudflare clearances must remain distinct.
+	// Keep the historical Web/Build identity unchanged so existing Web sticky
+	// sessions survive the rollout; only the Console namespace gets a prefix.
+	identity = scopedResinIdentity(identity, scope)
 	ctx = WithAccountIdentity(ctx, identity)
 	ctx = WithEgressNode(ctx, credential.EgressNodeID)
 	lease, _, err := m.acquire(ctx, scope, strconv.FormatUint(credential.ID, 10), true, credential.EncryptedCloudflareCookie, credential.EgressNodeID)
 	return lease, err
+}
+
+func scopedResinIdentity(identity string, scope domain.Scope) string {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return ""
+	}
+	if scope == domain.ScopeConsole || scope == domain.ScopeConsoleAsset {
+		return "grok_console_" + identity
+	}
+	return identity
 }
 
 func (m *Manager) AcquireIfConfigured(ctx context.Context, scope domain.Scope, affinity string) (*Lease, bool, error) {
@@ -1109,8 +1134,12 @@ func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scop
 			return nil, false, err
 		}
 	}
+	persistedClearanceScopeMatches := clearancePersistenceScopeMatches(scope, selected.Scope)
 	cookies := ""
-	if usesBrowserClearance(scope) {
+	// A fallback node may belong to another browser surface. Its durable cookie
+	// belongs to that node's scope, so never hydrate it into a Console session
+	// that happens to borrow a Web transport.
+	if usesBrowserClearance(scope) && persistedClearanceScopeMatches {
 		cookies, err = m.cipher.Decrypt(selected.EncryptedCloudflareCookie)
 		if err != nil {
 			// Managed mode can recover a damaged persisted cookie by asking the
@@ -1137,8 +1166,13 @@ func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scop
 	// Manual mode may prefer account-bound cookies. Managed mode always enters
 	// the FlareSolverr lifecycle so stale imported cookies cannot bypass refresh.
 	if managedClearance {
-		clearanceKey = clearanceCacheKey(selected.ID, proxyURL, sticky)
-		cookies, userAgent, err = m.ensureClearance(ctx, selected, proxyURL, cookies, userAgent, clearanceKey, !sticky)
+		clearanceKey = clearanceCacheKeyForScope(scope, selected.ID, proxyURL, sticky)
+		// A physical Web node can be used as Console's fallback transport, but
+		// its persisted cookie belongs to the Web browser session. Keep Console's
+		// fallback solution process-local so it cannot overwrite or hydrate the
+		// Web node's durable Clearance state.
+		persistClearance := !sticky && persistedClearanceScopeMatches
+		cookies, userAgent, err = m.ensureClearance(ctx, scope, selected, proxyURL, cookies, userAgent, clearanceKey, persistClearance)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1172,6 +1206,11 @@ func usesBrowserClearance(scope domain.Scope) bool {
 	return scope != domain.ScopeBuild && scope != domain.ScopeConsoleAsset
 }
 
+func clearancePersistenceScopeMatches(requestScope, nodeScope domain.Scope) bool {
+	return nodeScope == requestScope ||
+		(requestScope == domain.ScopeWebAsset && nodeScope == domain.ScopeWeb)
+}
+
 func (m *Manager) inflightCounter(nodeID uint64) *atomic.Int64 {
 	// Counters remain address-stable for the manager lifetime so a concurrent
 	// release can never decrement a replacement counter after an ABA deletion.
@@ -1194,15 +1233,40 @@ func (m *Manager) decrementInflight(nodeID uint64) {
 }
 
 func clearanceCacheKey(nodeID uint64, proxyURL string, sticky bool) string {
-	if nodeID == 0 {
-		return "direct"
+	return clearanceCacheKeyForScope(domain.ScopeWeb, nodeID, proxyURL, sticky)
+}
+
+// clearanceCacheKeyForScope keeps the historical Web key format so existing
+// persisted/node-local state remains reusable, while Console gets an explicit
+// namespace even when it falls back to the same physical Resin node. WebAsset
+// intentionally shares Web's browser session; ConsoleAsset does not use
+// Clearance at all.
+func clearanceCacheKeyForScope(scope domain.Scope, nodeID uint64, proxyURL string, sticky bool) string {
+	clearanceScope := scope
+	if clearanceScope == domain.ScopeWebAsset {
+		clearanceScope = domain.ScopeWeb
 	}
-	base := "node:" + strconv.FormatUint(nodeID, 10)
+	scopeSuffix := ""
+	if clearanceScope != domain.ScopeWeb {
+		scopeSuffix = ":scope:" + string(clearanceScope)
+	}
+	if nodeID == 0 {
+		return "direct" + scopeSuffix
+	}
+	base := "node:" + strconv.FormatUint(nodeID, 10) + scopeSuffix
 	if !sticky {
 		return base
 	}
 	digest := sha256.Sum256([]byte(proxyURL))
 	return base + ":account:" + fmt.Sprintf("%x", digest[:16])
+}
+
+func isDirectClearanceKey(key string) bool {
+	return key == "direct" || strings.HasPrefix(key, "direct:")
+}
+
+func hasCloudflareChallengeHeader(header http.Header) bool {
+	return header != nil && strings.EqualFold(strings.TrimSpace(header.Get("cf-mitigated")), "challenge")
 }
 
 func renderAccountProxyURL(template, accountKey string) (string, error) {
@@ -1621,11 +1685,11 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 	if status == clientClosedRequestStatus || errors.Is(transportErr, context.Canceled) {
 		return
 	}
-	// Console media hosts are public and do not use clearance credentials. A
-	// 403 there commonly describes the object URL (expired, rejected, or
-	// missing), not the proxy's ability to reach the origin, so it must not cool
-	// or rotate an otherwise healthy primary Console node.
-	if scope == domain.ScopeConsoleAsset && transportErr == nil && status == http.StatusForbidden {
+	// An HTTP 403 is an upstream/application result, not proof that the proxy
+	// endpoint is unhealthy. Callers classify a Cloudflare challenge before
+	// invalidating the exact Clearance binding; this generic feedback path must
+	// not cool or rebuild a healthy node for ordinary account/quota/media 403s.
+	if transportErr == nil && status == http.StatusForbidden {
 		return
 	}
 	if neterrorpkg.IsUpstreamStreamIdleTimeout(transportErr) {
@@ -1636,14 +1700,6 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 	}
 	if nodeID == 0 {
 		if transportErr != nil || (scope != domain.ScopeBuild && status == http.StatusForbidden) {
-			m.clearanceMu.Lock()
-			if isGrokWebScope(scope) && status == http.StatusForbidden && m.clearanceConfig.Mode == "flaresolverr" {
-				state := m.clearances["direct"]
-				state.invalid = true
-				state.used = true
-				m.clearances["direct"] = state
-			}
-			m.clearanceMu.Unlock()
 			m.clientMu.Lock()
 			stale := m.invalidateClientForScopeLocked(0, scope)
 			m.clientMu.Unlock()
@@ -1692,15 +1748,6 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 		value.Health = max(0.05, value.Health*0.7)
 		value.CooldownUntil = nil
 		value.LastError = "anti-bot rejection"
-		m.clearanceMu.Lock()
-		if isGrokWebScope(scope) && m.clearanceConfig.Mode == "flaresolverr" {
-			key := clearanceCacheKey(nodeID, "", false)
-			state := m.clearances[key]
-			state.invalid = true
-			state.used = true
-			m.clearances[key] = state
-		}
-		m.clearanceMu.Unlock()
 		m.clientMu.Lock()
 		stale = m.invalidateClientLocked(nodeID)
 		m.clientMu.Unlock()
@@ -1761,7 +1808,7 @@ func (m *Manager) clearanceMode() string {
 	return m.clearanceConfig.Mode
 }
 
-func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyURL, existingCookies, existingUserAgent, key string, persist bool) (string, string, error) {
+func (m *Manager) ensureClearance(ctx context.Context, scope domain.Scope, node domain.Node, proxyURL, existingCookies, existingUserAgent, key string, persist bool) (string, string, error) {
 	m.clearanceMu.Lock()
 	cfg := m.clearanceConfig
 	version := m.clearanceVersion
@@ -1771,14 +1818,20 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 	bindingFingerprint := clearanceBindingFingerprint(cfg, proxyURL)
 	m.cleanupClearanceCacheLocked(now, interval)
 	state, known := m.clearances[key]
-	if key == "direct" {
+	if isDirectClearanceKey(key) {
 		if !known {
 			m.ensureClearanceCacheCapacityLocked()
 		}
 		state.used = true
 		m.clearances[key] = state
 	}
-	if (!known || state.userAgent == "") && persist && (existingCookies != "" || node.ClearanceRefreshedAt != nil) {
+	// Node persistence predates scoped Web/Console sessions and stores one
+	// cookie per physical node. Do not hydrate a Console cache from a Web node's
+	// persisted cookie when Console is using the Web node as a fallback. A
+	// dedicated node in the matching scope may still reuse its imported state.
+	persistedScopeMatches := node.Scope == scope ||
+		(scope == domain.ScopeWebAsset && node.Scope == domain.ScopeWeb)
+	if (!known || state.userAgent == "") && persist && persistedScopeMatches && (existingCookies != "" || node.ClearanceRefreshedAt != nil) {
 		if !known {
 			m.ensureClearanceCacheCapacityLocked()
 		}
@@ -1810,6 +1863,18 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 		(state.bindingFingerprint == "" || state.bindingFingerprint == bindingFingerprint)
 	fallback := clearanceSolution{Cookies: state.cookies, UserAgent: state.userAgent}
 	forceRefresh := known && state.invalid
+	// A successful browser solve may legitimately return no challenge cookie.
+	// Keep that negative result for a short interval so a stream of ordinary
+	// application 403s cannot relaunch Chromium for the same account/session.
+	if !state.solveBackoffUntil.IsZero() && now.Before(state.solveBackoffUntil) {
+		state.lastUsedAt = now
+		m.clearances[key] = state
+		m.clearanceMu.Unlock()
+		if fallbackAllowed && !state.invalid {
+			return fallback.Cookies, fallback.UserAgent, nil
+		}
+		return "", "", errors.New("Cloudflare Clearance 求解正在冷却")
+	}
 	refreshAfter := time.Time{}
 	if forceRefresh {
 		refreshAfter = state.refreshedAt
@@ -1895,8 +1960,14 @@ func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, k
 	}
 	solveCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if err := m.acquireClearanceSolverSlot(solveCtx); err != nil {
+		m.markClearanceSolveBackoff(key, time.Now().UTC().Add(clearanceSolveFailureCooldown))
+		return clearanceSolution{}, fmt.Errorf("等待 Clearance 求解并发槽位: %w", err)
+	}
+	defer m.releaseClearanceSolverSlot()
 	solution, err := solver.Solve(solveCtx, cfg, proxyURL)
 	if err != nil {
+		m.markClearanceSolveBackoff(key, time.Now().UTC().Add(clearanceSolveFailureCooldown))
 		m.recordClearanceError(ctx, node, persist)
 		return clearanceSolution{}, fmt.Errorf("刷新出口 %q 的 Cloudflare Clearance: %w", node.Name, err)
 	}
@@ -1975,10 +2046,45 @@ func (m *Manager) cacheClearance(key string, solution clearanceSolution, refresh
 	if _, exists := m.clearances[key]; !exists {
 		m.ensureClearanceCacheCapacityLocked()
 	}
-	m.clearances[key] = clearanceState{
+	state := clearanceState{
 		cookies: solution.Cookies, userAgent: solution.UserAgent, refreshedAt: refreshedAt,
 		used: true, version: version, fingerprint: fingerprint, bindingFingerprint: bindingFingerprint, lastUsedAt: now,
 	}
+	if strings.TrimSpace(solution.Cookies) == "" {
+		state.solveBackoffUntil = now.Add(clearanceNoChallengeCooldown)
+	}
+	m.clearances[key] = state
+	m.clearanceMu.Unlock()
+}
+
+func (m *Manager) acquireClearanceSolverSlot(ctx context.Context) error {
+	m.clearanceSolverOnce.Do(func() {
+		m.clearanceSolverSlots = make(chan struct{}, maxConcurrentClearanceSolves)
+	})
+	select {
+	case m.clearanceSolverSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) releaseClearanceSolverSlot() {
+	if m == nil || m.clearanceSolverSlots == nil {
+		return
+	}
+	<-m.clearanceSolverSlots
+}
+
+func (m *Manager) markClearanceSolveBackoff(key string, until time.Time) {
+	if m == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	m.clearanceMu.Lock()
+	state := m.clearances[key]
+	state.solveBackoffUntil = until
+	state.lastUsedAt = time.Now().UTC()
+	m.clearances[key] = state
 	m.clearanceMu.Unlock()
 }
 
@@ -2069,8 +2175,9 @@ func (m *Manager) recordClearanceError(ctx context.Context, node domain.Node, pe
 
 func (m *Manager) RefreshClearance(ctx context.Context, nodeID uint64) error {
 	if nodeID == 0 {
-		_, err, _ := m.clearanceLoads.Do("direct", func() (any, error) {
-			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", "direct", false, true, true, time.Time{})
+		key := clearanceCacheKeyForScope(domain.ScopeWeb, 0, "", false)
+		_, err, _ := m.clearanceLoads.Do(key, func() (any, error) {
+			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", key, false, true, true, time.Time{})
 		})
 		return err
 	}
@@ -2092,7 +2199,7 @@ func (m *Manager) RefreshClearance(ctx context.Context, nodeID uint64) error {
 	if err != nil {
 		return err
 	}
-	key := clearanceCacheKey(node.ID, proxyURL, false)
+	key := clearanceCacheKeyForScope(node.Scope, node.ID, proxyURL, false)
 	_, err, _ = m.clearanceLoads.Do(key, func() (any, error) {
 		return m.refreshNode(ctx, node, proxyURL, key, true, true, true, time.Time{})
 	})
@@ -2109,6 +2216,9 @@ func (m *Manager) InvalidateClearance(nodeID uint64) {
 		if key == prefix || strings.HasPrefix(key, prefix+":") {
 			state.invalid = true
 			state.used = true
+			// A newly observed challenge is stronger evidence than a previous
+			// solver failure, so it explicitly overrides the short retry backoff.
+			state.solveBackoffUntil = time.Time{}
 			m.clearances[key] = state
 		}
 	}
@@ -2197,6 +2307,9 @@ func (m *Manager) invalidateClearanceKey(key string, client requestClient) {
 	state := m.clearances[key]
 	state.invalid = true
 	state.used = true
+	// A newly classified challenge must be able to retry immediately even if a
+	// previous solve failed. Subsequent failures repopulate this backoff.
+	state.solveBackoffUntil = time.Time{}
 	state.lastUsedAt = time.Now().UTC()
 	m.clearances[key] = state
 	m.clearanceMu.Unlock()
@@ -2208,7 +2321,8 @@ func (m *Manager) invalidateClearanceKey(key string, client requestClient) {
 func (m *Manager) RefreshDueClearances(ctx context.Context, force bool) error {
 	m.clearanceMu.Lock()
 	cfg := m.clearanceConfig
-	direct := m.clearances["direct"]
+	directKey := clearanceCacheKeyForScope(domain.ScopeWeb, 0, "", false)
+	direct := m.clearances[directKey]
 	version := m.clearanceVersion
 	m.clearanceMu.Unlock()
 	if cfg.Mode != "flaresolverr" {
@@ -2243,7 +2357,7 @@ func (m *Manager) RefreshDueClearances(ctx context.Context, force bool) error {
 			continue
 		}
 		m.clearanceMu.Lock()
-		key := clearanceCacheKey(node.ID, proxyURL, false)
+		key := clearanceCacheKeyForScope(node.Scope, node.ID, proxyURL, false)
 		state, known := m.clearances[key]
 		m.clearanceMu.Unlock()
 		fingerprint := clearanceFingerprint(cfg, proxyURL)
@@ -2266,8 +2380,8 @@ func (m *Manager) RefreshDueClearances(ctx context.Context, force bool) error {
 	}
 	shouldUseDirect := direct.used || force && webNodeCount == 0
 	if shouldUseDirect && (force || direct.invalid || direct.userAgent == "" || direct.version != version || now.Sub(direct.refreshedAt) >= interval) {
-		_, err, _ := m.clearanceLoads.Do("direct", func() (any, error) {
-			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", "direct", false, force, false, time.Time{})
+		_, err, _ := m.clearanceLoads.Do(directKey, func() (any, error) {
+			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", directKey, false, force, false, time.Time{})
 		})
 		if err != nil {
 			refreshErrors = append(refreshErrors, err)

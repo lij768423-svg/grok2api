@@ -46,13 +46,14 @@ func (e *webMediaUpstreamError) HTTPStatusCode() int {
 
 // isClearanceRefreshableMediaError distinguishes browser-session challenges
 // from structured upstream policy responses such as content moderation. Empty
-// and HTML 403 bodies are the forms returned by the media endpoints when the
-// request is rejected before the application response is built.
+// responses and generic HTML are not enough evidence: media backends also use
+// them for application rejections, and treating either as a challenge would
+// repeatedly launch FlareSolverr for a condition it cannot solve.
 func isClearanceRefreshableMediaError(e *webMediaUpstreamError) bool {
 	if e == nil || e.status != http.StatusForbidden {
 		return false
 	}
-	return e.cloudflareChallenge || e.bodyKind == "empty" || e.bodyKind == "html"
+	return e.cloudflareChallenge
 }
 
 func (e *webMediaUpstreamError) providerResponse() *provider.Response {
@@ -90,6 +91,10 @@ var (
 // bounded, redacted summary through the error. Structured logs retain only
 // body metadata and a prefix hash, never the upstream response body itself.
 func newWebMediaUpstreamError(status int, body []byte, truncated bool) *webMediaUpstreamError {
+	return newWebMediaUpstreamErrorWithHeader(status, nil, body, truncated)
+}
+
+func newWebMediaUpstreamErrorWithHeader(status int, header http.Header, body []byte, truncated bool) *webMediaUpstreamError {
 	digest := sha256.Sum256(body)
 	return &webMediaUpstreamError{
 		status:              status,
@@ -98,7 +103,7 @@ func newWebMediaUpstreamError(status int, body []byte, truncated bool) *webMedia
 		bodyTruncated:       truncated,
 		bodyPrefixSHA256:    fmt.Sprintf("%x", digest),
 		bodyKind:            classifyWebMediaDiagnosticBody(body),
-		cloudflareChallenge: isCloudflareChallengeBody(body),
+		cloudflareChallenge: provider.IsCloudflareChallengeResponse(header, body),
 	}
 }
 
@@ -123,14 +128,6 @@ func classifyWebMediaDiagnosticBody(body []byte) string {
 		}
 	}
 	return "text"
-}
-
-func isCloudflareChallengeBody(body []byte) bool {
-	lower := strings.ToLower(string(body))
-	return strings.Contains(lower, "just a moment") ||
-		strings.Contains(lower, "challenge-platform") ||
-		strings.Contains(lower, "__cf_chl") ||
-		strings.Contains(lower, "cf-chl-")
 }
 
 func (a *Adapter) logWebMediaUpstreamRejection(stage string, response *http.Response, upstreamErr *webMediaUpstreamError) {
@@ -388,7 +385,7 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 		if truncated {
 			body = body[:webMediaDiagnosticBodyLimit]
 		}
-		return provider.VideoResult{}, "", newWebMediaUpstreamError(response.StatusCode, body, truncated)
+		return provider.VideoResult{}, "", newWebMediaUpstreamErrorWithHeader(response.StatusCode, response.Header, body, truncated)
 	}
 	var result provider.VideoResult
 	var postID string

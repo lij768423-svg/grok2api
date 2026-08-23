@@ -398,7 +398,7 @@ Resin usernames can contain `{account}`:
 socks5h://Default.{account}:RESIN_PROXY_TOKEN@resin:2260
 ```
 
-The placeholder becomes a stable anonymous identity. Linked Web, Build, and Console accounts can share it; raw tokens and email addresses are not used.
+The placeholder becomes a stable anonymous identity. Linked Web and Build accounts keep the historical identity; Console receives a separate `grok_console_` namespace (including when it falls back to a Web node), so browser Clearance and cookies are never shared across those surfaces. Raw tokens and email addresses are not used.
 
 For managed Web/Console Cloudflare Clearance:
 

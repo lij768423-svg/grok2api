@@ -231,7 +231,7 @@ func (a *Adapter) fetchDPoPSession(ctx context.Context, ssoToken string, lease *
 	clockSkew := dpopClockSkewFromDateHeader(response.Header.Get("Date"), localBefore, localAfter)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		if response.StatusCode == http.StatusForbidden {
-			if shouldInvalidateConsoleClearance(data) {
+			if shouldInvalidateConsoleClearance(response.Header, data) {
 				lease.InvalidateClearance()
 			}
 		}
