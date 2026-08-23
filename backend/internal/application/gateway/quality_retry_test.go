@@ -233,6 +233,26 @@ func TestObserveQualityChunkThinkingChat(t *testing.T) {
 	}
 }
 
+func TestObserveQualityChunkEncryptedReasoningMarkerDelivers(t *testing.T) {
+	t.Parallel()
+	state := qualityScanState{protocol: qualityProtocolChat}
+	content := strings.Repeat("answer ", 40)
+	ObserveQualityChunk(&state, []byte(sse(
+		": grok2api-reasoning-start",
+		": grok2api-reasoning-encrypted",
+		`data: {"choices":[{"delta":{"content":"`+content+`"}}]}`,
+		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]",
+	)))
+	sig := state.signals()
+	if !sig.HasThinking || !sig.Terminal {
+		t.Fatalf("encrypted reasoning marker signals = %#v", sig)
+	}
+	if ClassifyQualityHold(sig, 32) != QualityDeliver {
+		t.Fatalf("encrypted reasoning marker must deliver")
+	}
+}
+
 func TestObserveQualityChunkNoThinkEnoughChat(t *testing.T) {
 	t.Parallel()
 	state := qualityScanState{protocol: qualityProtocolChat}

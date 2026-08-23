@@ -51,6 +51,23 @@ func (c *streamConverter) markChatReasoningStart() error {
 	return nil
 }
 
+// markEncryptedReasoning preserves a trustworthy upstream signal for the
+// gateway quality scanner. SSE comments are ignored by Chat and Messages
+// clients, so the public response contract remains unchanged.
+func (c *streamConverter) markEncryptedReasoning() error {
+	if c.encryptedReasoningMark {
+		return nil
+	}
+	if err := c.start(); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(c.writer, ": grok2api-reasoning-encrypted\n\n"); err != nil {
+		return err
+	}
+	c.encryptedReasoningMark = true
+	return nil
+}
+
 func (c *streamConverter) toolStartChat(item responseItem, _ int) error {
 	if err := c.start(); err != nil {
 		return err

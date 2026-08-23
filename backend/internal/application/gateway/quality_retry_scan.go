@@ -18,7 +18,11 @@ const (
 	qualityProtocolResponses   = "responses"
 	qualityProtocolAnthropic   = "anthropic"
 	qualityReasoningSSEComment = ": grok2api-reasoning-start"
-	qualityHoldMaxBufferBytes  = 4 << 20
+	// The conversation adapter emits this comment when the Responses upstream
+	// returned encrypted reasoning that is not representable in Chat/Anthropic
+	// JSON. Unlike the start marker, this is proof of actual thinking.
+	qualityEncryptedReasoningSSEComment = ": grok2api-reasoning-encrypted"
+	qualityHoldMaxBufferBytes           = 4 << 20
 )
 
 type qualityScanState struct {
@@ -175,6 +179,11 @@ func ObserveQualityChunk(state *qualityScanState, chunk []byte) {
 			state.reasoningStarted = true
 			continue
 		}
+		if bytes.Equal(line, []byte(qualityEncryptedReasoningSSEComment)) {
+			state.hasThinking = true
+			state.reasoningStarted = true
+			continue
+		}
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
@@ -270,14 +279,14 @@ func noteResponsesReasoningItem(state *qualityScanState, item qualityReasoningIt
 
 func observeQualityResponses(state *qualityScanState, payload []byte) {
 	var event struct {
-		Type  string `json:"type"`
-		Delta string `json:"delta"`
-		Item  qualityReasoningItem
+		Type     string `json:"type"`
+		Delta    string `json:"delta"`
+		Item     qualityReasoningItem
 		Response *struct {
 			ID     string                 `json:"id"`
 			Model  string                 `json:"model"`
 			Output []qualityReasoningItem `json:"output"`
-			Usage *struct {
+			Usage  *struct {
 				OutputTokens        int64 `json:"output_tokens"`
 				InputTokens         int64 `json:"input_tokens"`
 				TotalTokens         int64 `json:"total_tokens"`

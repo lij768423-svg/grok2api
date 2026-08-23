@@ -928,6 +928,32 @@ func TestConvertResponsesStreamMarksChatReasoningStart(t *testing.T) {
 	}
 }
 
+func TestConvertResponsesStreamMarksEncryptedReasoningForQualityScanner(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.20-0309-reasoning"}}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`, "",
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","delta":"answer"}`, "",
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","encrypted_content":"opaque-signature"}}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"status":"completed","usage":{"output_tokens":40,"output_tokens_details":{"reasoning_tokens":35}}}}`, "", "",
+	}, "\n")
+	converted, err := io.ReadAll(ConvertResponseStream(io.NopCloser(strings.NewReader(stream)), OperationChat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	if strings.Count(text, ": grok2api-reasoning-encrypted\n\n") != 1 {
+		t.Fatalf("encrypted reasoning marker count = %d, stream = %s", strings.Count(text, ": grok2api-reasoning-encrypted\n\n"), text)
+	}
+	if strings.Contains(text, "opaque-signature") {
+		t.Fatalf("encrypted reasoning payload must not leak into Chat stream: %s", text)
+	}
+}
+
 func TestConvertResponsesStreamChatPrefersRawReasoningOverSummary(t *testing.T) {
 	stream := strings.Join([]string{
 		`event: response.created`,
