@@ -103,6 +103,47 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	}
 }
 
+func TestUpdateConsoleQualityRetryPersistsAndHotApplies(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.QualityGuard.RequestRetry.Enabled = true
+	repository := &runtimeSettingsRepositoryStub{}
+	var applied config.Config
+	service := NewService(cfg, time.Time{}, 0, repository, nil, func(next config.Config) { applied = next })
+
+	state, err := service.UpdateConsoleQualityRetry(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.Enabled || !state.ConsoleEnabled || !applied.QualityGuard.RequestRetry.ConsoleEnabled {
+		t.Fatalf("quality retry state was not applied: state=%#v config=%#v", state, applied.QualityGuard.RequestRetry)
+	}
+	if repository.value.QualityRetry == nil || !repository.value.QualityRetry.ConsoleEnabled {
+		t.Fatalf("quality retry state was not persisted: %#v", repository.value.QualityRetry)
+	}
+	reloaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.QualityGuard.RequestRetry.ConsoleEnabled {
+		t.Fatal("persisted Console retry state was not reloaded")
+	}
+}
+
+func TestLoadPersistedKeepsConsoleRetryFromYAMLWhenSettingIsMissing(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.QualityGuard.RequestRetry.ConsoleEnabled = true
+	value := toDomainConfig(cfg)
+	value.QualityRetry = nil
+	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.QualityGuard.RequestRetry.ConsoleEnabled {
+		t.Fatal("missing persisted Console retry setting overrode config.yaml")
+	}
+}
+
 func TestUpdateRejectsBuildResponseHeaderTimeoutOutsideSafeRange(t *testing.T) {
 	for _, value := range []string{"29s", "31m"} {
 		t.Run(value, func(t *testing.T) {

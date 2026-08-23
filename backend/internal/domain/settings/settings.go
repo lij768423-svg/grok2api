@@ -30,6 +30,16 @@ type Config struct {
 	Audit             AuditConfig
 	ClientKeyDefaults ClientKeyDefaultsConfig
 	Accounts          AccountsConfig
+	// QualityRetry is optional so persisted settings from before Console
+	// stream-quality recovery was configurable continue to use config.yaml.
+	QualityRetry *QualityRetryConfig `json:"qualityRetry,omitempty"`
+}
+
+// QualityRetryConfig contains the runtime-selectable scope of the gateway's
+// missing-thinking retry policy. The policy itself remains configured in
+// qualityGuard.requestRetry.
+type QualityRetryConfig struct {
+	ConsoleEnabled bool `json:"consoleEnabled"`
 }
 
 // ServerConfig 定义可热更新的推理入口容量参数。
@@ -98,10 +108,10 @@ type ProviderBuildConfig struct {
 
 // RoutingConfig 定义会话粘性、冷却和故障切换边界。
 type RoutingConfig struct {
-	StickyTTL       time.Duration
-	CooldownBase    time.Duration
-	CooldownMax     time.Duration
-	CapacityWait    time.Duration
+	StickyTTL        time.Duration
+	CooldownBase     time.Duration
+	CooldownMax      time.Duration
+	CapacityWait     time.Duration
 	MaxAttempts      int
 	VideoMaxAttempts int
 	PreferFreeBuild  bool

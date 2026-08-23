@@ -492,6 +492,7 @@ func accountAutoCleanConfig(value config.AccountsConfig) accountapp.AutoCleanCon
 func qualityRetryRuntime(value config.QualityGuardRequestRetryConfig) gateway.QualityRetryRuntime {
 	return gateway.QualityRetryRuntime{
 		Enabled:             value.Enabled,
+		ConsoleEnabled:      value.ConsoleEnabled,
 		MaxAttempts:         value.MaxAttempts,
 		HoldTimeout:         value.HoldTimeout.Value(),
 		MinOutputTokens:     int64(value.MinOutputTokens),

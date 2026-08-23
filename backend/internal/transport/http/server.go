@@ -157,7 +157,7 @@ func New(deps Dependencies) *gin.Engine {
 	dashboardhttp.NewHandler(deps.Dashboard).Register(adminProtected)
 	mediaHandler.RegisterAdmin(adminProtected)
 	settingshttp.NewHandler(deps.Settings).Register(adminProtected)
-	egressHandler := egresshttp.NewHandler(deps.Egress, deps.QualityGuardStatePath, deps.QualityGuardConfigPath).WithQualityGuardProbe(deps.QualityGuardProbe)
+	egressHandler := egresshttp.NewHandler(deps.Egress, deps.QualityGuardStatePath, deps.QualityGuardConfigPath).WithQualityGuardProbe(deps.QualityGuardProbe).WithSettings(deps.Settings)
 	egressHandler.Register(adminProtected)
 	systemhttp.NewHandler(func() string {
 		if deps.Settings != nil {

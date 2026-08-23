@@ -175,6 +175,14 @@ type Snapshot struct {
 	RestartRequired          []string
 }
 
+// QualityRetryState is the editable Console scope of the gateway's
+// request-quality retry policy. Enabled is configured separately by
+// qualityGuard.requestRetry.enabled.
+type QualityRetryState struct {
+	Enabled        bool
+	ConsoleEnabled bool
+}
+
 // Service 管理允许在线修改的配置，并向后台任务广播配置变更。
 type Service struct {
 	mu                     sync.RWMutex
@@ -225,6 +233,55 @@ func (s *Service) PublicAPIBaseURL() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.cfg.Frontend.EffectivePublicAPIBaseURL()
+}
+
+// QualityRetry returns the active request-quality retry scope without
+// exposing the rest of the quality guard configuration to the admin API.
+func (s *Service) QualityRetry() QualityRetryState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return qualityRetryState(s.cfg)
+}
+
+// UpdateConsoleQualityRetry persists and hot-applies Console eligibility for
+// the missing-thinking retry path. The underlying policy remains disabled
+// unless qualityGuard.requestRetry.enabled is configured separately.
+func (s *Service) UpdateConsoleQualityRetry(ctx context.Context, enabled bool) (QualityRetryState, error) {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	s.mu.RLock()
+	current := s.cfg
+	currentRevision := s.revision
+	s.mu.RUnlock()
+	if current.QualityGuard.RequestRetry.ConsoleEnabled == enabled {
+		return qualityRetryState(current), nil
+	}
+
+	next := current
+	next.QualityGuard.RequestRetry.ConsoleEnabled = enabled
+	updatedAt, revision, err := s.repository.Save(ctx, toDomainConfig(next), currentRevision)
+	if err != nil {
+		if errors.Is(err, repository.ErrConflict) {
+			return QualityRetryState{}, ErrConflict
+		}
+		return QualityRetryState{}, err
+	}
+
+	s.mu.Lock()
+	s.cfg = next
+	s.updatedAt = updatedAt
+	s.revision = revision
+	result := qualityRetryState(next)
+	apply := s.apply
+	s.mu.Unlock()
+	if apply != nil {
+		apply(next)
+	}
+	if s.notify != nil {
+		s.notify(ctx)
+	}
+	return result, nil
 }
 
 // Update 校验并持久化运行设置，再原子替换进程内配置。
@@ -426,6 +483,11 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		base.Accounts.BuildForbiddenReauthCodes = append([]string(nil), value.Accounts.BuildForbiddenReauthCodes...)
 	}
 	base.Accounts.ExcludeBuildBotFlaggedFromScheduling = value.Accounts.ExcludeBuildBotFlaggedFromScheduling
+	// Older runtime-settings payloads do not carry QualityRetry. Preserve the
+	// operator's config.yaml value until the setting is explicitly saved.
+	if value.QualityRetry != nil {
+		base.QualityGuard.RequestRetry.ConsoleEnabled = value.QualityRetry.ConsoleEnabled
+	}
 	return base
 }
 
@@ -495,6 +557,16 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			AutoCleanReauthMinAge:                value.Accounts.AutoCleanReauthMinAge.Value(),
 			AutoCleanIncludeDisabled:             value.Accounts.AutoCleanIncludeDisabled,
 		},
+		QualityRetry: &settingsdomain.QualityRetryConfig{
+			ConsoleEnabled: value.QualityGuard.RequestRetry.ConsoleEnabled,
+		},
+	}
+}
+
+func qualityRetryState(value config.Config) QualityRetryState {
+	return QualityRetryState{
+		Enabled:        value.QualityGuard.RequestRetry.Enabled,
+		ConsoleEnabled: value.QualityGuard.RequestRetry.ConsoleEnabled,
 	}
 }
 

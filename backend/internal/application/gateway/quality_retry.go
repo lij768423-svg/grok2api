@@ -37,9 +37,13 @@ var (
 )
 
 // QualityRetryRuntime is the isolated request-path withhold/retry policy.
-// Zero Enabled leaves production behavior unchanged.
+// Zero Enabled leaves production behavior unchanged. ConsoleEnabled opts
+// Console streams into missing-thinking recovery. Keep it disabled by default:
+// Console Chat is converted from Responses SSE and its delayed reasoning usage
+// frame can otherwise look like no reasoning.
 type QualityRetryRuntime struct {
 	Enabled         bool
+	ConsoleEnabled  bool
 	MaxAttempts     int
 	HoldTimeout     time.Duration
 	MinOutputTokens int64
@@ -290,7 +294,16 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 	if isResponsesCompactionRequest(input.Body) {
 		return false
 	}
-	if route.Provider != accountdomain.ProviderBuild && route.Provider != accountdomain.ProviderConsole {
+	// Build remains enabled by the requestRetry policy. Console is opt-in: its
+	// Responses-to-Chat conversion can delay the reasoning usage frame until
+	// after visible text, so it must never enter this path accidentally.
+	switch route.Provider {
+	case accountdomain.ProviderBuild:
+	case accountdomain.ProviderConsole:
+		if !cfg.ConsoleEnabled {
+			return false
+		}
+	default:
 		return false
 	}
 	// Grok TUI always declares a tools schema, and after local tools run the

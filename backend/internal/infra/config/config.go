@@ -287,8 +287,12 @@ type QualityGuardConfig struct {
 }
 
 // QualityGuardRequestRetryConfig holds the in-process missing-thinking withhold policy.
+// ConsoleEnabled opts Console reasoning streams into the retry path. It
+// defaults to false because Console emits a delayed usage frame after its
+// Responses-to-Chat SSE conversion.
 type QualityGuardRequestRetryConfig struct {
 	Enabled         bool     `yaml:"enabled"`
+	ConsoleEnabled  bool     `yaml:"consoleEnabled"`
 	MaxAttempts     int      `yaml:"maxAttempts"`
 	HoldTimeout     Duration `yaml:"holdTimeout"`
 	MinOutputTokens int      `yaml:"minOutputTokens"`
@@ -931,14 +935,14 @@ func defaultConfig() Config {
 		},
 		QualityGuard: QualityGuardConfig{
 			Enabled: true,
-			Model: "grok-4.6", Mode: "passive",
+			Model:   "grok-4.6", Mode: "passive",
 			ActiveInterval: Duration(30 * time.Minute), PassivePollInterval: Duration(5 * time.Second),
 			SoftTPS: 500, HardTPS: 2500, ConsecutiveSoft: 2, ConsecutiveErrors: 2,
 			QuarantineDuration: Duration(5 * time.Minute), NoAccountBackoff: Duration(5 * time.Minute),
 			MinimumHealthyNodes: 1, MaxOutputTokens: 384,
 			MinimumGenerationWindow: Duration(time.Second), RotationTimeout: Duration(45 * time.Second),
 			RequestRetry: QualityGuardRequestRetryConfig{
-				Enabled: true,
+				Enabled:     true,
 				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
 				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
 			},

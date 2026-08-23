@@ -21,7 +21,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DegradeAccountsPanel } from "@/features/quality-guard/degrade-accounts-panel";
 import { ProbeProfilesPanel } from "@/features/quality-guard/probe-profiles-panel";
-import { getQualityGuardStatus, runQualityTest, updateQualityGuardPolicy, type QualityGuardEvent, type QualityGuardNodeState, type QualityGuardPolicy, type QualityGuardStatistics, type QualityGuardStatus, type QualityTestResult } from "@/features/quality-guard/quality-guard-api";
+import { getQualityGuardStatus, runQualityTest, updateConsoleQualityRetry, updateQualityGuardPolicy, type QualityGuardEvent, type QualityGuardNodeState, type QualityGuardPolicy, type QualityGuardStatistics, type QualityGuardStatus, type QualityTestResult } from "@/features/quality-guard/quality-guard-api";
 import { createEgressNode, deleteEgressNodes, listAllEgressNodes, updateEgressNode, updateEgressNodesEnabled, type EgressNodeDTO, type EgressNodeInput } from "@/features/settings/settings-api";
 import { ErrorState } from "@/shared/components/data-state";
 import { PageHeader } from "@/shared/components/page-header";
@@ -42,6 +42,14 @@ export function QualityGuardPage() {
     queryKey: ["quality-guard"],
     queryFn: getQualityGuardStatus,
     refetchInterval: 5_000,
+  });
+  const consoleRetryMutation = useMutation({
+    mutationFn: updateConsoleQualityRetry,
+    onSuccess: (requestRetry) => {
+      queryClient.setQueryData<QualityGuardStatus>(["quality-guard"], (current) => current ? { ...current, requestRetry } : current);
+      toast.success(t("qualityGuard.consoleRetrySaved"));
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("qualityGuard.consoleRetryFailed")),
   });
   const nodesQuery = useQuery({
     queryKey: ["quality-guard-egress-nodes"],
@@ -162,6 +170,12 @@ export function QualityGuardPage() {
         )}
       />
 
+      <ConsoleRetryCard
+        requestRetry={status?.requestRetry}
+        loading={statusQuery.isPending || consoleRetryMutation.isPending}
+        onChange={(enabled) => consoleRetryMutation.mutate(enabled)}
+      />
+
       <Tabs defaultValue="nodes">
         <TabsList>
           <TabsTrigger value="nodes">{t("qualityGuard.nodesTab")}</TabsTrigger>
@@ -249,6 +263,24 @@ export function QualityGuardPage() {
       </Tabs>
     </div>
   );
+}
+
+function ConsoleRetryCard({ requestRetry, loading, onChange }: { requestRetry?: QualityGuardStatus["requestRetry"]; loading: boolean; onChange: (enabled: boolean) => void }) {
+  const { t } = useTranslation();
+  const editable = requestRetry?.editable === true;
+  return <section className="flex flex-col gap-3 rounded-lg bg-card p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5" aria-labelledby="console-retry-title">
+    <div className="min-w-0">
+      <h2 id="console-retry-title" className="text-sm font-medium">{t("qualityGuard.consoleRetry")}</h2>
+      <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">{t("qualityGuard.consoleRetryHelp")}</p>
+      {requestRetry && !requestRetry.enabled ? <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">{t("qualityGuard.consoleRetryInactive")}</p> : null}
+    </div>
+    <Switch
+      checked={requestRetry?.consoleEnabled ?? false}
+      disabled={loading || !editable}
+      onCheckedChange={onChange}
+      aria-label={t("qualityGuard.consoleRetry")}
+    />
+  </section>;
 }
 
 function StatisticsPanel({ statistics, locale }: { statistics: QualityGuardStatistics; locale: string }) {

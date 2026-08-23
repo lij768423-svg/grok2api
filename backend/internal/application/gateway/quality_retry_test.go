@@ -651,6 +651,18 @@ func TestShouldHoldQualityStreamGates(t *testing.T) {
 	if !shouldHoldQualityStream(input, nil, route, audit.OperationChat, cfg) {
 		t.Fatal("expected hold on thinking build chat")
 	}
+	consoleRoute := route
+	consoleRoute.Provider = accountdomain.ProviderConsole
+	consoleInput := input
+	consoleInput.PublicModel = "grok-4.6"
+	if shouldHoldQualityStream(consoleInput, nil, consoleRoute, audit.OperationChat, cfg) {
+		t.Fatal("console reasoning streams must not enter the Build quality retry path")
+	}
+	consoleEnabled := cfg
+	consoleEnabled.ConsoleEnabled = true
+	if !shouldHoldQualityStream(consoleInput, nil, consoleRoute, audit.OperationChat, consoleEnabled) {
+		t.Fatal("console reasoning streams must enter quality retry when explicitly enabled")
+	}
 	off := cfg
 	off.Enabled = false
 	if shouldHoldQualityStream(input, nil, route, audit.OperationChat, off) {
