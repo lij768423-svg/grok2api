@@ -257,7 +257,7 @@ function SeriesChart({ series, empty, title }: { series: DegradeSummaryDTO["seri
   const max = Math.max(1, ...series.map((item) => item.count));
   const labelStep = series.length > 12 ? Math.ceil(series.length / 8) : 1;
   return (
-    <section className="flex h-full min-h-64 flex-col overflow-hidden rounded-lg bg-card">
+    <section className="flex h-72 min-h-72 max-h-72 flex-col overflow-hidden rounded-lg bg-card sm:h-80 sm:min-h-80 sm:max-h-80">
       <div className="shrink-0 border-b px-4 py-4 sm:px-5"><h2 className="text-sm font-medium">{title}</h2></div>
       <div className="flex min-h-0 flex-1 items-stretch gap-1 px-4 pb-3 pt-2 sm:px-5">
         {series.length === 0 ? <p className="self-center text-xs text-muted-foreground">{empty}</p> : series.map((item, index) => {
@@ -290,9 +290,9 @@ function shortSeriesLabel(label: string) {
 function NodeList({ nodes, empty, title }: { nodes: DegradeSummaryDTO["nodes"]; empty: string; title: string }) {
   const max = Math.max(1, ...nodes.map((node) => node.hits));
   return (
-    <section className="flex h-full min-h-64 flex-col overflow-hidden rounded-lg bg-card">
+    <section className="flex h-72 min-h-72 max-h-72 flex-col overflow-hidden rounded-lg bg-card sm:h-80 sm:min-h-80 sm:max-h-80">
       <div className="shrink-0 border-b px-4 py-4 sm:px-5"><h2 className="text-sm font-medium">{title}</h2></div>
-      <div className="min-h-0 flex-1 space-y-2 overflow-auto p-4 sm:p-5">
+      <div className="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain p-4 sm:p-5">
         {nodes.length === 0 ? <p className="text-xs text-muted-foreground">{empty}</p> : nodes.map((node) => (
           <div key={node.name} className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-3 text-xs">
             <div>

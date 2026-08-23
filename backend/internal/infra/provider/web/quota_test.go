@@ -238,12 +238,18 @@ func TestSyncQuotaGenericForbiddenIsNotUnauthorized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	egressRepository := &recordingWebEgressRepository{node: egressdomain.Node{
+		ID: 1, Name: "web", Scope: egressdomain.ScopeWeb, Enabled: true, Health: 1,
+	}}
 	adapter := NewAdapter(Config{
 		BaseURL: server.URL, StatsigMode: "manual", StatsigManualValue: "test-signature",
-	}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
+	}, infraegress.NewManager(egressRepository, cipher), cipher, nil, nil)
 	_, err = adapter.SyncQuota(context.Background(), account.Credential{ID: 5, WebTier: account.WebTierAuto, EncryptedAccessToken: encrypted})
-	if err == nil || errors.Is(err, provider.ErrUnauthorized) {
-		t.Fatalf("err = %v, want generic forbidden error", err)
+	if err == nil || errors.Is(err, provider.ErrUnauthorized) || !errors.Is(err, provider.ErrQuotaForbidden) {
+		t.Fatalf("err = %v, want ErrQuotaForbidden", err)
+	}
+	if updates := egressRepository.UpdateCount(); updates != 0 {
+		t.Fatalf("ordinary quota 403 changed egress health %d times", updates)
 	}
 }
 

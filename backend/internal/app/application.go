@@ -29,6 +29,7 @@ import (
 	updatecheckapp "github.com/chenyme/grok2api/backend/internal/application/updatecheck"
 	"github.com/chenyme/grok2api/backend/internal/buildinfo"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	inframedia "github.com/chenyme/grok2api/backend/internal/infra/media"
@@ -490,9 +491,23 @@ func accountAutoCleanConfig(value config.AccountsConfig) accountapp.AutoCleanCon
 }
 
 func qualityRetryRuntime(value config.QualityGuardRequestRetryConfig) gateway.QualityRetryRuntime {
+	policies := make(map[string]modeldomain.QualityGuardModelState, len(value.ModelPolicies))
+	for _, policy := range value.ModelPolicies {
+		providerValue := account.Provider(strings.TrimSpace(policy.Provider))
+		upstream, ok := modeldomain.NormalizeUpstreamModel(providerValue, policy.UpstreamModel)
+		if !ok {
+			continue
+		}
+		state := modeldomain.NormalizeQualityGuardModelState(policy.State)
+		if state == modeldomain.QualityGuardModelUnknown {
+			continue
+		}
+		policies[modeldomain.QualityGuardModelKey(providerValue, upstream)] = state
+	}
 	return gateway.QualityRetryRuntime{
 		Enabled:             value.Enabled,
 		ConsoleEnabled:      value.ConsoleEnabled,
+		ModelPolicies:       policies,
 		MaxAttempts:         value.MaxAttempts,
 		HoldTimeout:         value.HoldTimeout.Value(),
 		MinOutputTokens:     int64(value.MinOutputTokens),

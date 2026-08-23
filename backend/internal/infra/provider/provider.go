@@ -21,7 +21,11 @@ var (
 	ErrAuthorizationDenied  = errors.New("authorization denied")
 	ErrCredentialLimit      = errors.New("credential count exceeds limit")
 	ErrUnauthorized         = errors.New("upstream credential unauthorized")
-	ErrBirthDateAlreadySet  = errors.New("upstream birth date is already set")
+	// ErrQuotaForbidden means a quota endpoint rejected the request without a
+	// definitive credential block or a Cloudflare challenge. Callers may cool
+	// down background quota probes without invalidating the browser clearance.
+	ErrQuotaForbidden      = errors.New("upstream quota endpoint forbidden")
+	ErrBirthDateAlreadySet = errors.New("upstream birth date is already set")
 )
 
 // HTTPStatusError preserves the upstream status when a streaming or asynchronous Provider cannot return a Response.
@@ -466,6 +470,11 @@ type QuotaSnapshot struct {
 	Tier     account.WebTier
 	Windows  []account.QuotaWindow
 	SyncedAt time.Time
+	// BackgroundForbidden records a non-challenge quota 403 encountered while
+	// another part of a composite snapshot still succeeded. The account layer
+	// uses it to cool the low-priority catch-up scan without discarding good
+	// quota windows.
+	BackgroundForbidden bool
 }
 
 // QuotaGroupSnapshot is an authoritative snapshot for a group of quota modes

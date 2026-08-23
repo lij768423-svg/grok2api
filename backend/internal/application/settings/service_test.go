@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -126,6 +128,39 @@ func TestUpdateConsoleQualityRetryPersistsAndHotApplies(t *testing.T) {
 	}
 	if !reloaded.QualityGuard.RequestRetry.ConsoleEnabled {
 		t.Fatal("persisted Console retry state was not reloaded")
+	}
+}
+
+func TestUpdateQualityRetryModelPolicyIsProviderScopedAndReversible(t *testing.T) {
+	cfg := testConfig(t)
+	repository := &runtimeSettingsRepositoryStub{}
+	var applied config.Config
+	service := NewService(cfg, time.Time{}, 0, repository, nil, func(next config.Config) { applied = next })
+
+	state, err := service.UpdateQualityRetryModelPolicy(context.Background(), accountdomain.ProviderConsole, "grok-4.5", "enabled")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := service.QualityRetryModelState(accountdomain.ProviderConsole, "grok-4.5"); got != modeldomain.QualityGuardModelEnabled {
+		t.Fatalf("console policy state = %q", got)
+	}
+	if got := service.QualityRetryModelState(accountdomain.ProviderBuild, "grok-4.5"); got != modeldomain.QualityGuardModelEnabled {
+		t.Fatalf("build default state = %q", got)
+	}
+	if len(state.ModelPolicies) != 1 || len(applied.QualityGuard.RequestRetry.ModelPolicies) != 1 {
+		t.Fatalf("policy was not persisted/applied: state=%#v applied=%#v", state, applied.QualityGuard.RequestRetry.ModelPolicies)
+	}
+	if _, err := service.UpdateQualityRetryModelPolicy(context.Background(), accountdomain.ProviderConsole, "grok-4.5", "unknown"); err != nil {
+		t.Fatal(err)
+	}
+	if got := service.QualityRetryModelState(accountdomain.ProviderConsole, "grok-4.5"); got != modeldomain.QualityGuardModelUnknown {
+		t.Fatalf("cleared console policy state = %q", got)
+	}
+	if _, err := service.UpdateQualityRetryModelPolicy(context.Background(), accountdomain.ProviderWeb, "grok-4.20-0309-non-reasoning", "enabled"); err != nil {
+		t.Fatal(err)
+	}
+	if got := service.QualityRetryModelState(accountdomain.ProviderWeb, "grok-4.20-0309-non-reasoning"); got != modeldomain.QualityGuardModelEnabled {
+		t.Fatalf("explicit web policy state = %q", got)
 	}
 }
 

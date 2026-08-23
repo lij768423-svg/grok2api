@@ -297,6 +297,101 @@ func TestAccountRepositoryReplacesQuotaGroupWithoutTouchingOtherModes(t *testing
 	}
 }
 
+func TestWebQuotaCatchupCooldownExcludesAndRestoresStaleAccount(t *testing.T) {
+	ctx := context.Background()
+	repo := NewAccountRepository(openTestDatabase(t))
+	value, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "quota-cooldown", SourceKey: "quota-cooldown",
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now().UTC().Add(time.Minute)
+	ids, err := repo.ListStaleWebQuotaAccountIDs(ctx, before, 100)
+	if err != nil || len(ids) != 1 || ids[0] != value.ID {
+		t.Fatalf("initial stale ids = %#v, err=%v", ids, err)
+	}
+	retryAt := time.Now().UTC().Add(time.Hour)
+	if err := repo.MarkWebQuotaSyncCooldown(ctx, value.ID, retryAt); err != nil {
+		t.Fatal(err)
+	}
+	ids, err = repo.ListStaleWebQuotaAccountIDs(ctx, before, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("cooling account remained in stale ids: %#v", ids)
+	}
+	if err := repo.ClearWebQuotaSyncCooldown(ctx, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	ids, err = repo.ListStaleWebQuotaAccountIDs(ctx, before, 100)
+	if err != nil || len(ids) != 1 || ids[0] != value.ID {
+		t.Fatalf("cleared cooldown stale ids = %#v, err=%v", ids, err)
+	}
+}
+
+func TestDueQuotaWindowsSkipCoolingWebAccountsOnly(t *testing.T) {
+	ctx := context.Background()
+	repo := NewAccountRepository(openTestDatabase(t))
+	now := time.Now().UTC()
+	resetAt := now.Add(-time.Minute)
+	create := func(providerValue account.Provider, name string) account.Credential {
+		value, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+			Provider: providerValue, AuthType: account.AuthTypeSSO, Name: name, SourceKey: name,
+			EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive, Enabled: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.SaveQuotaWindows(ctx, value.ID, account.WebTierAuto, now, []account.QuotaWindow{{
+			AccountID: value.ID, Mode: "fast", Remaining: 0, Total: 10, ResetAt: &resetAt, UpdatedAt: now,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	coolingWeb := create(account.ProviderWeb, "cooling-web")
+	activeWeb := create(account.ProviderWeb, "active-web")
+	build := create(account.ProviderBuild, "build")
+	console := create(account.ProviderConsole, "console")
+	if err := repo.MarkWebQuotaSyncCooldown(ctx, coolingWeb.ID, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	values, err := repo.ListDueQuotaWindows(ctx, now, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[uint64]bool, len(values))
+	for _, value := range values {
+		seen[value.AccountID] = true
+	}
+	if seen[coolingWeb.ID] {
+		t.Fatalf("cooling Web account remained in due windows: %#v", values)
+	}
+	recovery, err := repo.ListQuotaRecoveryWindows(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoverySeen := make(map[uint64]bool, len(recovery))
+	for _, value := range recovery {
+		recoverySeen[value.AccountID] = true
+		if value.AccountID == coolingWeb.ID {
+			t.Fatalf("cooling Web account was reconstructed into startup recovery: %#v", recovery)
+		}
+	}
+	for _, value := range []account.Credential{activeWeb, build, console} {
+		if !seen[value.ID] {
+			t.Fatalf("non-cooling account %d was omitted from due windows: %#v", value.ID, values)
+		}
+		if !recoverySeen[value.ID] {
+			t.Fatalf("non-cooling account %d was omitted from startup recovery: %#v", value.ID, recovery)
+		}
+	}
+}
+
 func TestAccountRepositorySummarizesOperationalStates(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -502,7 +597,7 @@ func TestFreshSchemaContract(t *testing.T) {
 	}
 	assertTableColumns(t, database, "provider_accounts", []string{"provider", "source_key", "auth_status", "build_api_fallback", "build_route_mode", "build_super_entitled"}, []string{"oidc_client_id", "expires_at", "encrypted_access_token", "encrypted_refresh_token"})
 	assertTableColumns(t, database, "account_credentials", []string{"account_id", "auth_type", "client_id", "encrypted_primary", "encrypted_refresh", "expires_at", "refresh_due_at", "last_refresh_at", "refresh_failures", "refresh_unclassified_auth_failures", "last_refresh_error_status", "last_refresh_error", "last_refresh_error_message", "last_refresh_error_response", "refresh_permanent"}, nil)
-	assertTableColumns(t, database, "web_account_profiles", []string{"account_id", "tier", "synced_at", "nsfw_enabled_at"}, nil)
+	assertTableColumns(t, database, "web_account_profiles", []string{"account_id", "tier", "synced_at", "quota_retry_after", "nsfw_enabled_at"}, nil)
 	assertTableColumns(t, database, "admin_sessions", nil, []string{"revoked_at"})
 	assertTableColumns(t, database, "account_model_capabilities", []string{"account_id", "upstream_model"}, []string{"provider", "synced_at"})
 	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds", "first_token_ms"}, nil)

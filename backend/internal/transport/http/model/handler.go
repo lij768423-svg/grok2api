@@ -12,6 +12,7 @@ import (
 	"time"
 
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
+	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -19,14 +20,26 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-type Handler struct{ service *modelapp.Service }
+type Handler struct {
+	service  *modelapp.Service
+	settings *settingsapp.Service
+}
 
 const (
 	modelSyncHeartbeatInterval = 15 * time.Second
 	modelSyncWriteTimeout      = 30 * time.Second
 )
 
-func NewHandler(service *modelapp.Service) *Handler { return &Handler{service: service} }
+// NewHandler accepts the settings service as an optional dependency so small
+// transport tests and older embedders can continue to construct the model
+// handler without runtime settings.
+func NewHandler(service *modelapp.Service, settings ...*settingsapp.Service) *Handler {
+	var settingsService *settingsapp.Service
+	if len(settings) > 0 {
+		settingsService = settings[0]
+	}
+	return &Handler{service: service, settings: settingsService}
+}
 
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/models", h.list)
@@ -37,6 +50,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.PATCH("/models/batch", h.batchUpdate)
 	router.DELETE("/models", h.batchDelete)
 	router.PATCH("/models/:id", h.update)
+	router.PATCH("/models/:id/quality-guard", h.updateQualityGuard)
 	router.DELETE("/models/:id", h.delete)
 }
 
@@ -79,6 +93,7 @@ type modelResponse struct {
 	TotalAccounts     int        `json:"totalAccounts"`
 	CapabilityKnown   bool       `json:"capabilityKnown"`
 	Available         bool       `json:"available"`
+	QualityGuardState string     `json:"qualityGuardState"`
 	LastSyncedAt      *time.Time `json:"lastSyncedAt,omitempty"`
 }
 
@@ -111,7 +126,7 @@ func (h *Handler) list(c *gin.Context) {
 	}
 	items := make([]modelResponse, 0, len(values))
 	for _, value := range values {
-		items = append(items, newModelResponse(value))
+		items = append(items, h.modelResponse(value))
 	}
 	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
 }
@@ -132,7 +147,7 @@ func (h *Handler) listGroups(c *gin.Context) {
 	}
 	items := make([]modelGroupResponse, 0, len(values))
 	for _, value := range values {
-		items = append(items, newModelGroupResponse(value))
+		items = append(items, h.modelGroupResponse(value))
 	}
 	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
 }
@@ -196,7 +211,7 @@ func (h *Handler) create(c *gin.Context) {
 		h.writeServiceError(c, "modelCreateFailed", err)
 		return
 	}
-	response.Success(c, http.StatusCreated, newModelResponse(value))
+	response.Success(c, http.StatusCreated, h.modelResponse(value))
 }
 
 func (h *Handler) batchUpdate(c *gin.Context) {
@@ -357,7 +372,51 @@ func (h *Handler) update(c *gin.Context) {
 		h.writeServiceError(c, "modelUpdateFailed", err)
 		return
 	}
-	response.Success(c, http.StatusOK, newModelResponse(value))
+	response.Success(c, http.StatusOK, h.modelResponse(value))
+}
+
+type qualityGuardRequest struct {
+	State string `json:"state"`
+}
+
+func (h *Handler) updateQualityGuard(c *gin.Context) {
+	if h.settings == nil {
+		response.Error(c, http.StatusServiceUnavailable, "qualityGuardUnavailable", "质量守护模型策略暂不可用")
+		return
+	}
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 {
+		response.Error(c, http.StatusBadRequest, "invalidId", "ID 无效")
+		return
+	}
+	route, err := h.service.Get(c.Request.Context(), id)
+	if err != nil {
+		h.writeServiceError(c, "modelQualityGuardFailed", err)
+		return
+	}
+	if !isQualityGuardTextCapability(route.Capability) {
+		response.Error(c, http.StatusBadRequest, "qualityGuardUnsupported", "媒体和语音模型不支持质量守护")
+		return
+	}
+	var request qualityGuardRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	state := modeldomain.NormalizeQualityGuardModelState(request.State)
+	if strings.TrimSpace(request.State) != string(state) {
+		response.Error(c, http.StatusBadRequest, "invalidQualityGuardState", "质量守护状态必须是 enabled、disabled 或 unknown")
+		return
+	}
+	if _, err := h.settings.UpdateQualityRetryModelPolicy(c.Request.Context(), route.Provider, route.UpstreamModel, string(state)); err != nil {
+		h.writeQualityGuardError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"state":         h.qualityGuardState(route),
+		"provider":      string(route.Provider),
+		"upstreamModel": modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
+	})
 }
 
 func (h *Handler) delete(c *gin.Context) {
@@ -387,6 +446,52 @@ func (h *Handler) writeServiceError(c *gin.Context, code string, err error) {
 	}
 }
 
+func (h *Handler) writeQualityGuardError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, settingsapp.ErrInvalidInput):
+		response.Error(c, http.StatusBadRequest, "invalidQualityGuardState", err.Error())
+	case errors.Is(err, settingsapp.ErrConflict):
+		response.Error(c, http.StatusConflict, "settingsConflict", err.Error())
+	default:
+		response.Error(c, http.StatusInternalServerError, "qualityGuardUpdateFailed", "保存质量守护模型策略失败")
+	}
+}
+
+func (h *Handler) modelResponse(value modeldomain.Route) modelResponse {
+	result := newModelResponse(value)
+	result.QualityGuardState = h.qualityGuardState(value)
+	return result
+}
+
+func (h *Handler) modelGroupResponse(value modelapp.RouteGroup) modelGroupResponse {
+	routes := make([]modelResponse, 0, len(value.Routes))
+	ids := make([]string, 0, len(value.Routes))
+	for _, route := range value.Routes {
+		routes = append(routes, h.modelResponse(route))
+		ids = append(ids, strconv.FormatUint(route.ID, 10))
+	}
+	return modelGroupResponse{Key: strings.Join(ids, ":"), Routes: routes, EndpointCapabilities: append([]string(nil), value.EndpointCapabilities...)}
+}
+
+func (h *Handler) qualityGuardState(value modeldomain.Route) string {
+	if !isQualityGuardTextCapability(value.Capability) {
+		return string(modeldomain.QualityGuardModelDisabled)
+	}
+	if h.settings == nil {
+		return string(modeldomain.DefaultQualityGuardModelState(value.Provider, value.UpstreamModel))
+	}
+	return string(h.settings.QualityRetryModelState(value.Provider, value.UpstreamModel))
+}
+
+func isQualityGuardTextCapability(value modeldomain.Capability) bool {
+	switch value {
+	case modeldomain.CapabilityResponses, modeldomain.CapabilityChat:
+		return true
+	default:
+		return false
+	}
+}
+
 func newModelResponse(value modeldomain.Route) modelResponse {
 	manualBinding := len(value.BoundAccountIDs) > 0
 	// Console uses a provider-wide static catalog, so catalog support is known
@@ -401,7 +506,7 @@ func newModelResponse(value modeldomain.Route) modelResponse {
 		ID: value.ID, PublicID: modeldomain.ExternalPublicID(value.Provider, value.PublicID), Provider: string(value.Provider), UpstreamModel: modeldomain.DisplayUpstreamModel(value.Provider, value.UpstreamModel), Capability: string(value.Capability),
 		Enabled: value.Enabled, Origin: string(value.Origin), AccountIDs: accountIDs, BindingMode: manualBinding, SupportedAccounts: value.SupportedAccounts,
 		SyncedAccounts: value.SyncedAccounts, TotalAccounts: value.TotalAccounts, CapabilityKnown: capabilityKnown,
-		Available: available, LastSyncedAt: value.LastSyncedAt,
+		Available: available, QualityGuardState: string(modeldomain.DefaultQualityGuardModelState(value.Provider, value.UpstreamModel)), LastSyncedAt: value.LastSyncedAt,
 	}
 }
 

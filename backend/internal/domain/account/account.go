@@ -182,6 +182,9 @@ type Credential struct {
 	ObservedModelAt  *time.Time
 	WebTier          WebTier
 	WebTierSyncedAt  *time.Time
+	// WebQuotaRetryAfter suppresses low-priority quota catch-up after a normal
+	// product 403. It is independent from routing health and account auth.
+	WebQuotaRetryAfter *time.Time
 	// EgressIdentity 是不含凭据和个人信息的稳定出口身份。
 	// 关联到同一 Web 账号的 Build/Console 只共享该值，不共享任何运行状态。
 	EgressIdentity string

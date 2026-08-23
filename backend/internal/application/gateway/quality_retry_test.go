@@ -680,8 +680,21 @@ func TestShouldHoldQualityStreamGates(t *testing.T) {
 	}
 	consoleEnabled := cfg
 	consoleEnabled.ConsoleEnabled = true
+	if shouldHoldQualityStream(consoleInput, nil, consoleRoute, audit.OperationChat, consoleEnabled) {
+		t.Fatal("console reasoning streams must remain outside the guard without a model policy")
+	}
+	multiAgentRoute := consoleRoute
+	multiAgentRoute.UpstreamModel = "grok-4.20-multi-agent-0309"
+	multiAgentInput := consoleInput
+	multiAgentInput.PublicModel = "grok-4.20-multi-agent-0309"
+	if shouldHoldQualityStream(multiAgentInput, nil, multiAgentRoute, audit.OperationChat, consoleEnabled) {
+		t.Fatal("unverified Console multi-agent streams must not enter quality retry")
+	}
+	consoleEnabled.ModelPolicies = map[string]modeldomain.QualityGuardModelState{
+		modeldomain.QualityGuardModelKey(accountdomain.ProviderConsole, "grok-4.6"): modeldomain.QualityGuardModelEnabled,
+	}
 	if !shouldHoldQualityStream(consoleInput, nil, consoleRoute, audit.OperationChat, consoleEnabled) {
-		t.Fatal("console reasoning streams must enter quality retry when explicitly enabled")
+		t.Fatal("console reasoning streams must enter quality retry when their model is explicitly enabled")
 	}
 	off := cfg
 	off.Enabled = false

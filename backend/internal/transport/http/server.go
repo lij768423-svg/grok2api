@@ -150,7 +150,7 @@ func New(deps Dependencies) *gin.Engine {
 	adminProtected.Use(middleware.AdminAuth(deps.AdminAuth))
 	authHandler.RegisterAuthenticated(adminProtected)
 	accounthttp.NewHandler(deps.Accounts, deps.AccountSync).Register(adminProtected)
-	modelhttp.NewHandler(deps.Models).Register(adminProtected)
+	modelhttp.NewHandler(deps.Models, deps.Settings).Register(adminProtected)
 	clientkeyhttp.NewHandler(deps.ClientKeys).Register(adminProtected)
 	auditHandler := audithttp.NewHandler(deps.Audits)
 	auditHandler.Register(adminProtected)

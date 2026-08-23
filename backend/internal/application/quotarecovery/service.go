@@ -2,6 +2,7 @@ package quotarecovery
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -23,6 +24,18 @@ const (
 type quotaSynchronizer interface {
 	ProbeQuotaMode(ctx context.Context, accountID uint64, mode string) (accountdomain.QuotaWindow, error)
 	ListDueQuotaWindows(ctx context.Context, now time.Time, limit int) ([]accountdomain.QuotaWindow, error)
+}
+
+type retryAfterError interface {
+	RetryAfterDuration() time.Duration
+}
+
+func retryAfterDuration(err error) time.Duration {
+	var value retryAfterError
+	if !errors.As(err, &value) {
+		return 0
+	}
+	return max(0, value.RetryAfterDuration())
 }
 
 type Service struct {
@@ -104,7 +117,12 @@ func (s *Service) runOne(ctx context.Context, now time.Time, value accountdomain
 		return
 	}
 	value.Attempts++
-	if probeErr == nil && window.ResetAt != nil && window.ResetAt.After(now) {
+	if retryAfter := retryAfterDuration(probeErr); retryAfter > 0 {
+		// A normal Web quota 403 carries a long background cooldown. Honor it
+		// here so an event that was already in the recovery queue cannot fall
+		// back to the short transport-error backoff.
+		value.DueAt = now.Add(retryAfter)
+	} else if probeErr == nil && window.ResetAt != nil && window.ResetAt.After(now) {
 		value.DueAt = *window.ResetAt
 	} else if probeErr == nil && value.Mode == "console" {
 		// Console usage currently exposes no reset timestamp. A healthy zero

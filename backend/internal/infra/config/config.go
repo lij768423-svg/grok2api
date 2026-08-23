@@ -291,16 +291,25 @@ type QualityGuardConfig struct {
 // defaults to false because Console emits a delayed usage frame after its
 // Responses-to-Chat SSE conversion.
 type QualityGuardRequestRetryConfig struct {
-	Enabled         bool     `yaml:"enabled"`
-	ConsoleEnabled  bool     `yaml:"consoleEnabled"`
-	MaxAttempts     int      `yaml:"maxAttempts"`
-	HoldTimeout     Duration `yaml:"holdTimeout"`
-	MinOutputTokens int      `yaml:"minOutputTokens"`
-	OnExhausted     string   `yaml:"onExhausted"`
-	AccountCooldown Duration `yaml:"accountCooldown"`
+	Enabled        bool `yaml:"enabled"`
+	ConsoleEnabled bool `yaml:"consoleEnabled"`
+	// ModelPolicies is keyed by provider + upstream model, never public aliases.
+	// An omitted model stays unverified and therefore cannot enter the hold path.
+	ModelPolicies   []QualityGuardRequestRetryModelPolicy `yaml:"modelPolicies"`
+	MaxAttempts     int                                   `yaml:"maxAttempts"`
+	HoldTimeout     Duration                              `yaml:"holdTimeout"`
+	MinOutputTokens int                                   `yaml:"minOutputTokens"`
+	OnExhausted     string                                `yaml:"onExhausted"`
+	AccountCooldown Duration                              `yaml:"accountCooldown"`
 	// IdleAccountCooldown cools an account after a truly empty upstream
 	// stream. Independent of accountCooldown (missing-thinking). Zero uses 24h.
 	IdleAccountCooldown Duration `yaml:"idleAccountCooldown"`
+}
+
+type QualityGuardRequestRetryModelPolicy struct {
+	Provider      string `yaml:"provider"`
+	UpstreamModel string `yaml:"upstreamModel"`
+	State         string `yaml:"state"`
 }
 
 type ClientKeyDefaultsConfig struct {
@@ -786,6 +795,26 @@ func validateQualityGuardConfig(value QualityGuardConfig) error {
 }
 
 func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) error {
+	seenPolicies := make(map[string]struct{}, len(value.ModelPolicies))
+	for _, policy := range value.ModelPolicies {
+		provider := strings.TrimSpace(policy.Provider)
+		upstream := strings.TrimSpace(policy.UpstreamModel)
+		if provider != "grok_build" && provider != "grok_web" && provider != "grok_console" {
+			return errors.New("qualityGuard.requestRetry.modelPolicies.provider 无效")
+		}
+		if upstream == "" || len([]rune(upstream)) > 255 {
+			return errors.New("qualityGuard.requestRetry.modelPolicies.upstreamModel 无效")
+		}
+		state := strings.ToLower(strings.TrimSpace(policy.State))
+		if state != "enabled" && state != "disabled" && state != "unknown" {
+			return errors.New("qualityGuard.requestRetry.modelPolicies.state 必须是 enabled、disabled 或 unknown")
+		}
+		key := provider + "\x00" + strings.ToLower(upstream)
+		if _, exists := seenPolicies[key]; exists {
+			return errors.New("qualityGuard.requestRetry.modelPolicies 不得包含重复模型")
+		}
+		seenPolicies[key] = struct{}{}
+	}
 	if !value.Enabled {
 		return nil
 	}

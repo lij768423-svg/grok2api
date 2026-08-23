@@ -66,6 +66,29 @@ func TestNewModelResponseKnowsStaticConsoleCapabilityWithoutAccountSync(t *testi
 	}
 }
 
+func TestQualityGuardTextCapabilityExcludesMedia(t *testing.T) {
+	for _, capability := range []modeldomain.Capability{
+		modeldomain.CapabilityResponses,
+		modeldomain.CapabilityChat,
+	} {
+		if !isQualityGuardTextCapability(capability) {
+			t.Fatalf("text capability %q was excluded", capability)
+		}
+	}
+	for _, capability := range []modeldomain.Capability{
+		modeldomain.CapabilityImage,
+		modeldomain.CapabilityImageEdit,
+		modeldomain.CapabilityVideo,
+		modeldomain.CapabilityTTS,
+		modeldomain.CapabilitySTT,
+		modeldomain.CapabilityRealtime,
+	} {
+		if isQualityGuardTextCapability(capability) {
+			t.Fatalf("media capability %q was included", capability)
+		}
+	}
+}
+
 func TestParseOptionalBoolRejectsAmbiguousValues(t *testing.T) {
 	for _, test := range []struct {
 		input string

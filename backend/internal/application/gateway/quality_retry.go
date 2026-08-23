@@ -42,8 +42,11 @@ var (
 // Console Chat is converted from Responses SSE and its delayed reasoning usage
 // frame can otherwise look like no reasoning.
 type QualityRetryRuntime struct {
-	Enabled         bool
-	ConsoleEnabled  bool
+	Enabled        bool
+	ConsoleEnabled bool
+	// ModelPolicies contains only explicit operator overrides. A missing key is
+	// resolved through model.DefaultQualityGuardModelState and is fail-closed.
+	ModelPolicies   map[string]modeldomain.QualityGuardModelState
 	MaxAttempts     int
 	HoldTimeout     time.Duration
 	MinOutputTokens int64
@@ -105,6 +108,9 @@ func normalizeQualityRetry(cfg QualityRetryRuntime) QualityRetryRuntime {
 		cfg.IdleAccountCooldown = qualityIdleAccountCooldown
 	}
 	cfg.OnExhausted = normalizeQualityExhaustionPolicy(cfg.OnExhausted)
+	if cfg.ModelPolicies == nil {
+		cfg.ModelPolicies = make(map[string]modeldomain.QualityGuardModelState)
+	}
 	return cfg
 }
 
@@ -303,6 +309,8 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 		if !cfg.ConsoleEnabled {
 			return false
 		}
+	case accountdomain.ProviderWeb:
+		// Web is supported only when a verified model policy explicitly opts it in.
 	default:
 		return false
 	}
@@ -317,10 +325,11 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 	if qualityRequestDisablesReasoning(input.Body) {
 		return false
 	}
-	if modeldomain.SupportsReasoningForProvider(route.Provider, input.PublicModel) {
-		return true
+	state, ok := cfg.ModelPolicies[modeldomain.QualityGuardModelKey(route.Provider, route.UpstreamModel)]
+	if !ok {
+		state = modeldomain.DefaultQualityGuardModelState(route.Provider, route.UpstreamModel)
 	}
-	return modeldomain.SupportsReasoningForProvider(route.Provider, route.UpstreamModel)
+	return state == modeldomain.QualityGuardModelEnabled
 }
 
 func qualityRequestHasInFlightToolResults(body []byte) bool {

@@ -22,12 +22,15 @@ const weeklyQuotaMode = "weekly"
 
 func (a *Adapter) SyncQuota(ctx context.Context, credential account.Credential) (provider.QuotaSnapshot, error) {
 	chatWindows := make([]account.QuotaWindow, 0, 2)
+	backgroundForbidden := false
 	autoWindow, autoErr := a.SyncQuotaMode(ctx, credential, "auto")
 	if errors.Is(autoErr, provider.ErrUnauthorized) {
 		return provider.QuotaSnapshot{}, autoErr
 	}
 	if autoErr == nil {
 		chatWindows = append(chatWindows, autoWindow)
+	} else if errors.Is(autoErr, provider.ErrQuotaForbidden) {
+		backgroundForbidden = true
 	}
 	fastWindow, fastErr := a.SyncQuotaMode(ctx, credential, "fast")
 	if errors.Is(fastErr, provider.ErrUnauthorized) {
@@ -35,6 +38,8 @@ func (a *Adapter) SyncQuota(ctx context.Context, credential account.Credential) 
 	}
 	if fastErr == nil {
 		chatWindows = append(chatWindows, fastWindow)
+	} else if errors.Is(fastErr, provider.ErrQuotaForbidden) {
+		backgroundForbidden = true
 	}
 	imagineSnapshot, imagineErr := a.SyncQuotaGroup(ctx, credential, account.QuotaGroupWebImagine)
 	if imagineErr != nil {
@@ -55,19 +60,21 @@ func (a *Adapter) SyncQuota(ctx context.Context, credential account.Credential) 
 				kept = append(kept, weekly)
 				kept = append(kept, imagineSnapshot.Windows...)
 				windows = kept
+			} else if errors.Is(weeklyErr, provider.ErrQuotaForbidden) {
+				backgroundForbidden = true
 			}
 		}
 		if windows == nil {
 			windows = append(chatWindows, imagineSnapshot.Windows...)
 		}
-		return provider.QuotaSnapshot{Tier: tier, Windows: windows, SyncedAt: time.Now().UTC()}, nil
+		return provider.QuotaSnapshot{Tier: tier, Windows: windows, SyncedAt: time.Now().UTC(), BackgroundForbidden: backgroundForbidden}, nil
 	}
 	// 模式端点暂不可用时，仅已确认的付费账号允许用 weekly 兜底；
 	// Basic/Auto 不能凭周额度探测提权，也不应制造无意义的付费端点流量。
 	if credential.WebTier == account.WebTierSuper || credential.WebTier == account.WebTierHeavy {
 		if weekly, weeklyErr := a.syncWeeklyCredits(ctx, credential); weeklyErr == nil {
 			kept := append([]account.QuotaWindow{weekly}, imagineSnapshot.Windows...)
-			return provider.QuotaSnapshot{Tier: credential.WebTier, Windows: kept, SyncedAt: time.Now().UTC()}, nil
+			return provider.QuotaSnapshot{Tier: credential.WebTier, Windows: kept, SyncedAt: time.Now().UTC(), BackgroundForbidden: backgroundForbidden}, nil
 		} else {
 			return provider.QuotaSnapshot{}, weeklyErr
 		}
@@ -122,7 +129,13 @@ func (a *Adapter) SyncQuotaGroup(ctx context.Context, credential account.Credent
 	if response.StatusCode == http.StatusForbidden && provider.IsDefinitiveAccountBlockBody(body) {
 		return provider.QuotaGroupSnapshot{}, fmt.Errorf("%w: account blocked", provider.ErrUnauthorized)
 	}
+	if response.StatusCode == http.StatusForbidden && provider.IsCloudflareChallengeResponse(response.Header, body) {
+		lease.InvalidateClearance()
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		if response.StatusCode == http.StatusForbidden {
+			return provider.QuotaGroupSnapshot{}, fmt.Errorf("%w: Grok Web Imagine 配额接口返回 403", provider.ErrQuotaForbidden)
+		}
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
 		return provider.QuotaGroupSnapshot{}, fmt.Errorf("Grok Web Imagine 配额接口返回 %d", response.StatusCode)
 	}
@@ -332,7 +345,9 @@ func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credenti
 			if provider.IsDefinitiveAccountBlockBody(body) {
 				return account.QuotaWindow{}, fmt.Errorf("%w: account blocked", provider.ErrUnauthorized)
 			}
-			lease.InvalidateClearance()
+			if provider.IsCloudflareChallengeResponse(response.Header, body) {
+				lease.InvalidateClearance()
+			}
 			if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, endpoint) {
 				continue
 			}
@@ -345,6 +360,9 @@ func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credenti
 		}
 		if response.StatusCode == http.StatusForbidden && provider.IsDefinitiveAccountBlockBody(body) {
 			return account.QuotaWindow{}, fmt.Errorf("%w: account blocked", provider.ErrUnauthorized)
+		}
+		if response.StatusCode == http.StatusForbidden {
+			return account.QuotaWindow{}, fmt.Errorf("%w: Grok Web 额度接口返回 403", provider.ErrQuotaForbidden)
 		}
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
 		return account.QuotaWindow{}, fmt.Errorf("Grok Web 额度接口返回 %d", response.StatusCode)
@@ -415,7 +433,12 @@ func (a *Adapter) syncWeeklyCredits(ctx context.Context, credential account.Cred
 			return account.QuotaWindow{}, fmt.Errorf("%w: account blocked", provider.ErrUnauthorized)
 		}
 		if response.StatusCode == http.StatusForbidden {
-			lease.InvalidateClearance()
+			if provider.IsCloudflareChallengeResponse(response.Header, body) {
+				lease.InvalidateClearance()
+			}
+		}
+		if response.StatusCode == http.StatusForbidden {
+			return account.QuotaWindow{}, fmt.Errorf("%w: Grok Web 周额度接口返回 403", provider.ErrQuotaForbidden)
 		}
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
 		return account.QuotaWindow{}, fmt.Errorf("Grok Web 周额度接口返回 %d", response.StatusCode)

@@ -73,6 +73,19 @@ func TestRunOnePreservesNonConsoleWindowDuration(t *testing.T) {
 	}
 }
 
+func TestRunOneHonorsProbeRetryAfterHint(t *testing.T) {
+	now := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
+	queue := &quotaQueueStub{}
+	syncer := &quotaSyncStub{probeErr: quotaProbeRetryError{after: 6 * time.Hour}}
+	service := NewService(testLogger(), queue, syncer, 30*time.Second, 30*time.Minute)
+
+	service.runOne(context.Background(), now, accountdomain.QuotaRecoveryEvent{AccountID: 9, Mode: "fast", DueAt: now, ClaimToken: "claim"})
+
+	if len(queue.rescheduled) != 1 || !queue.rescheduled[0].DueAt.Equal(now.Add(6*time.Hour)) {
+		t.Fatalf("rescheduled = %#v", queue.rescheduled)
+	}
+}
+
 type quotaQueueStub struct {
 	mu          sync.Mutex
 	claimed     []accountdomain.QuotaRecoveryEvent
@@ -132,6 +145,7 @@ type quotaSyncStub struct {
 	maxConcurrent int
 	due           []accountdomain.QuotaWindow
 	window        accountdomain.QuotaWindow
+	probeErr      error
 }
 
 func (s *quotaSyncStub) ProbeQuotaMode(_ context.Context, accountID uint64, mode string) (accountdomain.QuotaWindow, error) {
@@ -145,6 +159,9 @@ func (s *quotaSyncStub) ProbeQuotaMode(_ context.Context, accountID uint64, mode
 	s.mu.Lock()
 	s.current--
 	s.mu.Unlock()
+	if s.probeErr != nil {
+		return accountdomain.QuotaWindow{AccountID: accountID, Mode: mode}, s.probeErr
+	}
 	if s.window.Mode != "" {
 		window := s.window
 		window.AccountID = accountID
@@ -152,6 +169,12 @@ func (s *quotaSyncStub) ProbeQuotaMode(_ context.Context, accountID uint64, mode
 	}
 	return accountdomain.QuotaWindow{AccountID: accountID, Mode: mode, Remaining: 1}, nil
 }
+
+type quotaProbeRetryError struct{ after time.Duration }
+
+func (e quotaProbeRetryError) Error() string { return "quota probe temporarily cooling down" }
+
+func (e quotaProbeRetryError) RetryAfterDuration() time.Duration { return e.after }
 
 func (s *quotaSyncStub) ListDueQuotaWindows(context.Context, time.Time, int) ([]accountdomain.QuotaWindow, error) {
 	return s.due, nil

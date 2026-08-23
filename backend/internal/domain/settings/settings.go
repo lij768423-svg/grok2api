@@ -40,7 +40,26 @@ type Config struct {
 // qualityGuard.requestRetry.
 type QualityRetryConfig struct {
 	ConsoleEnabled bool `json:"consoleEnabled"`
+	// A pointer preserves the distinction between an older persisted settings
+	// document with no policy field and an explicit empty policy list. The
+	// latter is required when an operator clears the final override.
+	ModelPolicies *[]QualityRetryModelPolicy `json:"modelPolicies,omitempty"`
 }
+
+// QualityRetryModelPolicy is the operator override for one concrete upstream
+// model. The key deliberately contains the provider because the same model
+// slug can have different stream contracts on Build, Web, and Console.
+type QualityRetryModelPolicy struct {
+	Provider      string `json:"provider" yaml:"provider"`
+	UpstreamModel string `json:"upstreamModel" yaml:"upstreamModel"`
+	State         string `json:"state" yaml:"state"`
+}
+
+const (
+	QualityRetryPolicyEnabled  = "enabled"
+	QualityRetryPolicyDisabled = "disabled"
+	QualityRetryPolicyUnknown  = "unknown"
+)
 
 // ServerConfig 定义可热更新的推理入口容量参数。
 type ServerConfig struct {

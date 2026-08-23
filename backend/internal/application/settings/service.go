@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -179,8 +182,9 @@ type Snapshot struct {
 // request-quality retry policy. Enabled is configured separately by
 // qualityGuard.requestRetry.enabled.
 type QualityRetryState struct {
-	Enabled        bool
-	ConsoleEnabled bool
+	Enabled        bool                                     `json:"enabled"`
+	ConsoleEnabled bool                                     `json:"consoleEnabled"`
+	ModelPolicies  []settingsdomain.QualityRetryModelPolicy `json:"modelPolicies"`
 }
 
 // Service 管理允许在线修改的配置，并向后台任务广播配置变更。
@@ -260,6 +264,74 @@ func (s *Service) UpdateConsoleQualityRetry(ctx context.Context, enabled bool) (
 
 	next := current
 	next.QualityGuard.RequestRetry.ConsoleEnabled = enabled
+	updatedAt, revision, err := s.repository.Save(ctx, toDomainConfig(next), currentRevision)
+	if err != nil {
+		if errors.Is(err, repository.ErrConflict) {
+			return QualityRetryState{}, ErrConflict
+		}
+		return QualityRetryState{}, err
+	}
+
+	s.mu.Lock()
+	s.cfg = next
+	s.updatedAt = updatedAt
+	s.revision = revision
+	result := qualityRetryState(next)
+	apply := s.apply
+	s.mu.Unlock()
+	if apply != nil {
+		apply(next)
+	}
+	if s.notify != nil {
+		s.notify(ctx)
+	}
+	return result, nil
+}
+
+// QualityRetryModelState returns the effective state for one concrete route.
+// It deliberately does not infer stream eligibility from the model's declared
+// reasoning capability: only an explicit verified policy may enable a model.
+func (s *Service) QualityRetryModelState(providerValue accountdomain.Provider, upstreamModel string) modeldomain.QualityGuardModelState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return qualityRetryModelState(s.cfg, providerValue, upstreamModel)
+}
+
+// UpdateQualityRetryModelPolicy persists one model-level guard decision. State
+// unknown removes an override and falls back to the conservative built-in
+// policy, so new catalog models cannot accidentally inherit retry behavior.
+func (s *Service) UpdateQualityRetryModelPolicy(ctx context.Context, providerValue accountdomain.Provider, upstreamModel, state string) (QualityRetryState, error) {
+	providerValue = accountdomain.Provider(strings.TrimSpace(string(providerValue)))
+	if !providerValue.IsValid() {
+		return QualityRetryState{}, ErrInvalidInput
+	}
+	upstreamModel, ok := modeldomain.NormalizeUpstreamModel(providerValue, upstreamModel)
+	if !ok {
+		return QualityRetryState{}, ErrInvalidInput
+	}
+	normalizedState := modeldomain.NormalizeQualityGuardModelState(state)
+	if strings.TrimSpace(state) != string(normalizedState) {
+		return QualityRetryState{}, ErrInvalidInput
+	}
+
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	s.mu.RLock()
+	current := s.cfg
+	currentRevision := s.revision
+	s.mu.RUnlock()
+
+	policies := qualityRetryPoliciesByKey(current.QualityGuard.RequestRetry.ModelPolicies)
+	key := modeldomain.QualityGuardModelKey(providerValue, upstreamModel)
+	if normalizedState == modeldomain.QualityGuardModelUnknown {
+		delete(policies, key)
+	} else {
+		policies[key] = config.QualityGuardRequestRetryModelPolicy{
+			Provider: string(providerValue), UpstreamModel: upstreamModel, State: string(normalizedState),
+		}
+	}
+	next := current
+	next.QualityGuard.RequestRetry.ModelPolicies = sortedQualityRetryPolicies(policies)
 	updatedAt, revision, err := s.repository.Save(ctx, toDomainConfig(next), currentRevision)
 	if err != nil {
 		if errors.Is(err, repository.ErrConflict) {
@@ -487,6 +559,9 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	// operator's config.yaml value until the setting is explicitly saved.
 	if value.QualityRetry != nil {
 		base.QualityGuard.RequestRetry.ConsoleEnabled = value.QualityRetry.ConsoleEnabled
+		if value.QualityRetry.ModelPolicies != nil {
+			base.QualityGuard.RequestRetry.ModelPolicies = qualityRetryPoliciesFromDomain(*value.QualityRetry.ModelPolicies)
+		}
 	}
 	return base
 }
@@ -557,9 +632,10 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			AutoCleanReauthMinAge:                value.Accounts.AutoCleanReauthMinAge.Value(),
 			AutoCleanIncludeDisabled:             value.Accounts.AutoCleanIncludeDisabled,
 		},
-		QualityRetry: &settingsdomain.QualityRetryConfig{
-			ConsoleEnabled: value.QualityGuard.RequestRetry.ConsoleEnabled,
-		},
+		QualityRetry: func() *settingsdomain.QualityRetryConfig {
+			policies := qualityRetryPoliciesToDomain(value.QualityGuard.RequestRetry.ModelPolicies)
+			return &settingsdomain.QualityRetryConfig{ConsoleEnabled: value.QualityGuard.RequestRetry.ConsoleEnabled, ModelPolicies: &policies}
+		}(),
 	}
 }
 
@@ -567,7 +643,93 @@ func qualityRetryState(value config.Config) QualityRetryState {
 	return QualityRetryState{
 		Enabled:        value.QualityGuard.RequestRetry.Enabled,
 		ConsoleEnabled: value.QualityGuard.RequestRetry.ConsoleEnabled,
+		ModelPolicies:  qualityRetryPoliciesToDomain(value.QualityGuard.RequestRetry.ModelPolicies),
 	}
+}
+
+func qualityRetryPoliciesFromDomain(values []settingsdomain.QualityRetryModelPolicy) []config.QualityGuardRequestRetryModelPolicy {
+	result := make(map[string]config.QualityGuardRequestRetryModelPolicy, len(values))
+	for _, value := range values {
+		providerValue := accountdomain.Provider(strings.TrimSpace(value.Provider))
+		upstream, ok := modeldomain.NormalizeUpstreamModel(providerValue, value.UpstreamModel)
+		if !ok {
+			continue
+		}
+		state := modeldomain.NormalizeQualityGuardModelState(value.State)
+		if state == modeldomain.QualityGuardModelUnknown {
+			continue
+		}
+		result[modeldomain.QualityGuardModelKey(providerValue, upstream)] = config.QualityGuardRequestRetryModelPolicy{Provider: string(providerValue), UpstreamModel: upstream, State: string(state)}
+	}
+	return sortedQualityRetryPolicies(result)
+}
+
+func qualityRetryPoliciesToDomain(values []config.QualityGuardRequestRetryModelPolicy) []settingsdomain.QualityRetryModelPolicy {
+	result := make([]settingsdomain.QualityRetryModelPolicy, 0, len(values))
+	for _, value := range values {
+		providerValue := accountdomain.Provider(strings.TrimSpace(value.Provider))
+		upstream, ok := modeldomain.NormalizeUpstreamModel(providerValue, value.UpstreamModel)
+		if !ok {
+			continue
+		}
+		state := modeldomain.NormalizeQualityGuardModelState(value.State)
+		if state == modeldomain.QualityGuardModelUnknown {
+			continue
+		}
+		result = append(result, settingsdomain.QualityRetryModelPolicy{Provider: string(providerValue), UpstreamModel: upstream, State: string(state)})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		left := result[i].Provider + "\x00" + result[i].UpstreamModel
+		right := result[j].Provider + "\x00" + result[j].UpstreamModel
+		return left < right
+	})
+	return result
+}
+
+func qualityRetryPoliciesByKey(values []config.QualityGuardRequestRetryModelPolicy) map[string]config.QualityGuardRequestRetryModelPolicy {
+	result := make(map[string]config.QualityGuardRequestRetryModelPolicy, len(values))
+	for _, value := range values {
+		providerValue := accountdomain.Provider(strings.TrimSpace(value.Provider))
+		upstream, ok := modeldomain.NormalizeUpstreamModel(providerValue, value.UpstreamModel)
+		if !ok {
+			continue
+		}
+		state := modeldomain.NormalizeQualityGuardModelState(value.State)
+		if state == modeldomain.QualityGuardModelUnknown {
+			continue
+		}
+		result[modeldomain.QualityGuardModelKey(providerValue, upstream)] = config.QualityGuardRequestRetryModelPolicy{Provider: string(providerValue), UpstreamModel: upstream, State: string(state)}
+	}
+	return result
+}
+
+func sortedQualityRetryPolicies(values map[string]config.QualityGuardRequestRetryModelPolicy) []config.QualityGuardRequestRetryModelPolicy {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]config.QualityGuardRequestRetryModelPolicy, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, values[key])
+	}
+	return result
+}
+
+func qualityRetryModelState(value config.Config, providerValue accountdomain.Provider, upstreamModel string) modeldomain.QualityGuardModelState {
+	upstream, ok := modeldomain.NormalizeUpstreamModel(providerValue, upstreamModel)
+	if !ok {
+		upstream = strings.TrimSpace(upstreamModel)
+	}
+	for _, policy := range value.QualityGuard.RequestRetry.ModelPolicies {
+		if accountdomain.Provider(policy.Provider) == providerValue && strings.EqualFold(strings.TrimSpace(policy.UpstreamModel), upstream) {
+			state := modeldomain.NormalizeQualityGuardModelState(policy.State)
+			if state != modeldomain.QualityGuardModelUnknown {
+				return state
+			}
+		}
+	}
+	return modeldomain.DefaultQualityGuardModelState(providerValue, upstream)
 }
 
 func (s *Service) snapshotLocked() Snapshot {

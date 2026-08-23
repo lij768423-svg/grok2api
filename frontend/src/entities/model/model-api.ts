@@ -1,4 +1,4 @@
-import type { ModelRouteDTO, ModelRouteGroupDTO } from "@/entities/model/types";
+import type { ModelRouteDTO, ModelRouteGroupDTO, QualityGuardModelState } from "@/entities/model/types";
 import { ApiError, apiEventStream, apiRequest, type PaginatedDTO } from "@/shared/api/client";
 import { createObjectDecoder, createPaginatedDecoder, decodeBooleanResult, decodeCountResult, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isString } from "@/shared/api/decoder";
 import { i18n } from "@/shared/i18n";
@@ -32,13 +32,15 @@ const modelRouteValidator = hasShape({
   totalAccounts: isNumber,
   capabilityKnown: isBoolean,
   available: isBoolean,
+  qualityGuardState: isOneOf("enabled", "disabled", "unknown"),
   lastSyncedAt: isOptional(isString),
 });
 const decodeModelRoute = createObjectDecoder<ModelRouteDTO>("model route", {
   id: isString, publicId: isString, provider: isOneOf("grok_build", "grok_web", "grok_console"), upstreamModel: isString,
   capability: isOneOf("responses", "chat", "image", "image_edit", "video", "tts", "stt", "realtime"), origin: isOneOf("catalog", "discovered", "manual"),
   enabled: isBoolean, accountIds: isArrayOf(isString), bindingMode: isBoolean, supportedAccounts: isNumber,
-  syncedAccounts: isNumber, totalAccounts: isNumber, capabilityKnown: isBoolean, available: isBoolean, lastSyncedAt: isOptional(isString),
+  syncedAccounts: isNumber, totalAccounts: isNumber, capabilityKnown: isBoolean, available: isBoolean,
+  qualityGuardState: isOneOf("enabled", "disabled", "unknown"), lastSyncedAt: isOptional(isString),
 });
 const decodeModelPage = createPaginatedDecoder<ModelRouteDTO>(modelRouteValidator);
 const modelRouteGroupValidator = hasShape({
@@ -142,6 +144,14 @@ export function createModel(input: CreateModelInput): Promise<ModelRouteDTO> {
 
 export function updateModel(id: string, input: { publicId: string; enabled: boolean; accountIds: string[] }): Promise<ModelRouteDTO> {
   return apiRequest(`/api/admin/v1/models/${id}`, { method: "PATCH", body: input }, decodeModelRoute);
+}
+
+const decodeQualityGuardUpdate = createObjectDecoder<{ state: QualityGuardModelState }>("quality guard model state", {
+  state: isOneOf("enabled", "disabled", "unknown"),
+});
+
+export function updateModelQualityGuard(id: string, state: QualityGuardModelState): Promise<{ state: QualityGuardModelState }> {
+  return apiRequest(`/api/admin/v1/models/${id}/quality-guard`, { method: "PATCH", body: { state } }, decodeQualityGuardUpdate);
 }
 
 export function deleteModel(id: string): Promise<{ deleted: boolean }> {

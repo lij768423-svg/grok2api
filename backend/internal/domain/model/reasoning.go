@@ -6,6 +6,66 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 )
 
+// QualityGuardModelState is independent from the model's advertised reasoning
+// capability. It describes whether the current stream adapter has been
+// verified to expose a signal that the request-quality guard can trust.
+type QualityGuardModelState string
+
+const (
+	QualityGuardModelEnabled  QualityGuardModelState = "enabled"
+	QualityGuardModelDisabled QualityGuardModelState = "disabled"
+	QualityGuardModelUnknown  QualityGuardModelState = "unknown"
+)
+
+type QualityGuardModelPolicy struct {
+	Provider      account.Provider
+	UpstreamModel string
+	State         QualityGuardModelState
+}
+
+// QualityGuardModelKey is the stable runtime-settings key. Upstream model
+// values may arrive with a provider namespace in older catalog rows; strip it
+// before comparing so aliases cannot accidentally select another provider.
+func QualityGuardModelKey(providerValue account.Provider, upstreamModel string) string {
+	upstream, ok := NormalizeUpstreamModel(providerValue, upstreamModel)
+	if !ok {
+		upstream = strings.TrimSpace(upstreamModel)
+	}
+	return strings.ToLower(string(providerValue)) + "\x00" + strings.ToLower(upstream)
+}
+
+// DefaultQualityGuardModelState is deliberately conservative. Only the
+// long-standing Build 4.5/4.6 routes retain the previous request-path behavior;
+// all other reasoning-capable names remain unverified until a real stream test
+// is recorded. Known non-reasoning models are explicitly disabled.
+func DefaultQualityGuardModelState(providerValue account.Provider, upstreamModel string) QualityGuardModelState {
+	upstream := externalModelSlug(upstreamModel)
+	if base, _, ok := parseReasoningModelAliasSlug(upstream); ok {
+		upstream = base
+	}
+	upstream = strings.ToLower(strings.TrimSpace(upstream))
+	switch upstream {
+	case "grok-4.20-0309-non-reasoning", GrokComposer25Fast:
+		return QualityGuardModelDisabled
+	case "grok-4.5", "grok-4.6":
+		if providerValue == account.ProviderBuild {
+			return QualityGuardModelEnabled
+		}
+	}
+	return QualityGuardModelUnknown
+}
+
+func NormalizeQualityGuardModelState(value string) QualityGuardModelState {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case string(QualityGuardModelEnabled):
+		return QualityGuardModelEnabled
+	case string(QualityGuardModelDisabled):
+		return QualityGuardModelDisabled
+	default:
+		return QualityGuardModelUnknown
+	}
+}
+
 // ReasoningEffort is a client-facing reasoning depth level accepted by Grok models.
 // Only levels a model actually supports should be advertised or accepted as aliases.
 type ReasoningEffort = string

@@ -57,6 +57,7 @@ func toAccountDomain(value accountModel) account.Credential {
 	}
 	var webTier account.WebTier
 	var webTierSyncedAt *time.Time
+	var webQuotaRetryAfter *time.Time
 	var webNSFWEnabledAt *time.Time
 	var webTermsAcceptedAt *time.Time
 	var webTermsAcceptedVersion int
@@ -65,6 +66,7 @@ func toAccountDomain(value accountModel) account.Credential {
 	if value.WebProfile != nil {
 		webTier = account.WebTier(value.WebProfile.Tier)
 		webTierSyncedAt = value.WebProfile.SyncedAt
+		webQuotaRetryAfter = value.WebProfile.QuotaRetryAfter
 		webNSFWEnabledAt = value.WebProfile.NSFWEnabledAt
 		webTermsAcceptedVersion = value.WebProfile.TermsAcceptedVersion
 		if webTermsAcceptedVersion >= account.CurrentWebTermsVersion {
@@ -86,7 +88,7 @@ func toAccountDomain(value accountModel) account.Credential {
 		Enabled: value.Enabled, AuthStatus: account.AuthStatus(value.AuthStatus), ReauthMarkedAt: value.ReauthMarkedAt, Priority: value.Priority,
 		MaxConcurrent: value.MaxConcurrent, MinimumRemaining: value.MinimumRemaining, FailureCount: value.FailureCount,
 		CooldownUntil: value.CooldownUntil, LastError: value.LastError, LastUsedAt: value.LastUsedAt,
-		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt, WebTier: webTier, WebTierSyncedAt: webTierSyncedAt,
+		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt, WebTier: webTier, WebTierSyncedAt: webTierSyncedAt, WebQuotaRetryAfter: webQuotaRetryAfter,
 		WebNSFWEnabledAt: webNSFWEnabledAt, WebTermsAcceptedAt: webTermsAcceptedAt, WebTermsAcceptedVersion: webTermsAcceptedVersion, WebBirthDateSetAt: webBirthDateSetAt, EgressIdentity: egressIdentity,
 		EgressNodeID: valueEgressNodeID(value.EgressNodeID), EgressAssignmentMode: account.EgressAssignmentMode(value.EgressAssignmentMode), EgressAssignedAt: value.EgressAssignedAt,
 		BuildAPIFallback: value.BuildAPIFallback, BuildRouteMode: buildRouteMode,
@@ -199,7 +201,7 @@ func fromWebProfileDomain(value account.Credential) *webAccountProfileModel {
 	if tier == "" {
 		tier = account.WebTierAuto
 	}
-	return &webAccountProfileModel{AccountID: value.ID, Tier: string(tier), SyncedAt: value.WebTierSyncedAt, NSFWEnabledAt: value.WebNSFWEnabledAt, TermsAcceptedAt: value.WebTermsAcceptedAt, TermsAcceptedVersion: value.WebTermsAcceptedVersion, BirthDateSetAt: value.WebBirthDateSetAt, EgressIdentity: value.EgressIdentity}
+	return &webAccountProfileModel{AccountID: value.ID, Tier: string(tier), SyncedAt: value.WebTierSyncedAt, QuotaRetryAfter: value.WebQuotaRetryAfter, NSFWEnabledAt: value.WebNSFWEnabledAt, TermsAcceptedAt: value.WebTermsAcceptedAt, TermsAcceptedVersion: value.WebTermsAcceptedVersion, BirthDateSetAt: value.WebBirthDateSetAt, EgressIdentity: value.EgressIdentity}
 }
 
 func accountIdentity(value account.Credential) string {

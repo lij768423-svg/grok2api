@@ -114,6 +114,7 @@ type webAccountProfileModel struct {
 	AccountID            uint64 `gorm:"primaryKey"`
 	Tier                 string `gorm:"size:16;not null;check:chk_web_account_profiles_tier,tier IN ('auto','basic','super','heavy')"`
 	SyncedAt             *time.Time
+	QuotaRetryAfter      *time.Time
 	NSFWEnabledAt        *time.Time
 	TermsAcceptedAt      *time.Time
 	TermsAcceptedVersion int `gorm:"not null;default:0"`
