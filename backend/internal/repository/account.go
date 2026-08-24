@@ -179,6 +179,10 @@ type AccountRepository interface {
 	DecrementQuotaWindow(ctx context.Context, accountID uint64, mode string, now time.Time) (bool, error)
 	ExhaustQuotaWindow(ctx context.Context, accountID uint64, mode string, resetAt *time.Time, now time.Time) error
 	ListDueQuotaWindows(ctx context.Context, now time.Time, limit int) ([]account.QuotaWindow, error)
+	// ListDueWebQuotaAccountIDs returns distinct active Web accounts whose quota
+	// windows are due. It is used by the low-priority startup catch-up path so
+	// one account is refreshed once even when several windows expired together.
+	ListDueWebQuotaAccountIDs(ctx context.Context, now time.Time, limit int) ([]uint64, error)
 	ListQuotaRecoveryWindows(ctx context.Context, limit int) ([]account.QuotaWindow, error)
 	ListStaleWebQuotaAccountIDs(ctx context.Context, before time.Time, limit int) ([]uint64, error)
 }

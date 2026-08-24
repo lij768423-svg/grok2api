@@ -2517,6 +2517,30 @@ func (r *AccountRepository) ListDueQuotaWindows(ctx context.Context, now time.Ti
 	return values, nil
 }
 
+// ListDueWebQuotaAccountIDs collapses all due windows to one active Web account.
+// A full Web quota sync already refreshes the account's chat and media windows;
+// queueing each window separately multiplies upstream requests and bypasses the
+// dedicated, throttled catch-up pool.
+func (r *AccountRepository) ListDueWebQuotaAccountIDs(ctx context.Context, now time.Time, limit int) ([]uint64, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	var ids []uint64
+	err := r.db.db.WithContext(ctx).
+		Table("provider_accounts AS account").
+		Select("account.id").
+		Joins("INNER JOIN account_quota_windows AS quota ON quota.account_id = account.id").
+		Joins("LEFT JOIN web_account_profiles AS profile ON profile.account_id = account.id").
+		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ?", account.ProviderWeb, true, account.AuthStatusActive).
+		Where("quota.remaining = 0 AND quota.reset_at IS NOT NULL AND quota.reset_at <= ?", now).
+		Where("profile.quota_retry_after IS NULL OR profile.quota_retry_after <= ?", now).
+		Group("account.id").
+		Order("MIN(quota.reset_at) ASC, account.id ASC").
+		Limit(limit).
+		Scan(&ids).Error
+	return ids, err
+}
+
 func (r *AccountRepository) ListQuotaRecoveryWindows(ctx context.Context, limit int) ([]account.QuotaWindow, error) {
 	if limit <= 0 || limit > 100000 {
 		limit = 100000

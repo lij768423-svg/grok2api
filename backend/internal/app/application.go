@@ -685,7 +685,6 @@ func (a *Application) Run(ctx context.Context) error {
 			})
 		})
 	}
-	a.queueDueWebQuotaRefresh(runCtx)
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

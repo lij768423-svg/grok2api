@@ -253,6 +253,53 @@ func TestSyncQuotaGenericForbiddenIsNotUnauthorized(t *testing.T) {
 	}
 }
 
+func TestBackgroundSyncQuotaDoesNotRetryGenericForbiddenStatsig(t *testing.T) {
+	var rateLimitCalls atomic.Int64
+	var imagineCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/rest/rate-limits" {
+			rateLimitCalls.Add(1)
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusForbidden)
+			_, _ = writer.Write([]byte(`{"message":"temporary rejection"}`))
+			return
+		}
+		if request.URL.Path == "/rest/media/imagine/quota_info" {
+			imagineCalls.Add(1)
+			writer.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if request.URL.Path == "/index" || request.URL.Path == "/" {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		http.NotFound(writer, request)
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("background-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapter(Config{
+		BaseURL: server.URL, StatsigMode: "url", StatsigSignerURL: "https://signer.example/sign",
+	}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
+	_, err = adapter.SyncQuota(infraegress.WithClearanceSolveSuppressed(context.Background()), account.Credential{ID: 8, WebTier: account.WebTierAuto, EncryptedAccessToken: encrypted})
+	if err == nil || !errors.Is(err, provider.ErrQuotaForbidden) {
+		t.Fatalf("err = %v, want ErrQuotaForbidden", err)
+	}
+	if rateLimitCalls.Load() != 1 {
+		t.Fatalf("background generic 403 made %d rate-limits requests, want 1", rateLimitCalls.Load())
+	}
+	if imagineCalls.Load() != 0 {
+		t.Fatalf("background generic 403 continued into Imagine quota %d times", imagineCalls.Load())
+	}
+}
+
 func TestSyncWeeklyCreditsBlockedForbiddenIsUnauthorized(t *testing.T) {
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

@@ -354,6 +354,12 @@ func TestDueQuotaWindowsSkipCoolingWebAccountsOnly(t *testing.T) {
 	}
 	coolingWeb := create(account.ProviderWeb, "cooling-web")
 	activeWeb := create(account.ProviderWeb, "active-web")
+	if err := repo.SaveQuotaWindows(ctx, activeWeb.ID, account.WebTierAuto, now, []account.QuotaWindow{
+		{AccountID: activeWeb.ID, Mode: "fast", Remaining: 0, Total: 10, ResetAt: &resetAt, UpdatedAt: now},
+		{AccountID: activeWeb.ID, Mode: "expert", Remaining: 0, Total: 10, ResetAt: &resetAt, UpdatedAt: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	build := create(account.ProviderBuild, "build")
 	console := create(account.ProviderConsole, "console")
 	if err := repo.MarkWebQuotaSyncCooldown(ctx, coolingWeb.ID, now.Add(time.Hour)); err != nil {
@@ -370,6 +376,20 @@ func TestDueQuotaWindowsSkipCoolingWebAccountsOnly(t *testing.T) {
 	}
 	if seen[coolingWeb.ID] {
 		t.Fatalf("cooling Web account remained in due windows: %#v", values)
+	}
+	dueIDs, err := repo.ListDueWebQuotaAccountIDs(ctx, now, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dueSeen := make(map[uint64]bool, len(dueIDs))
+	for _, id := range dueIDs {
+		dueSeen[id] = true
+	}
+	if dueSeen[coolingWeb.ID] || !dueSeen[activeWeb.ID] {
+		t.Fatalf("Web due account IDs = %#v", dueIDs)
+	}
+	if len(dueIDs) != 1 {
+		t.Fatalf("Web due account IDs were not deduplicated: %#v", dueIDs)
 	}
 	recovery, err := repo.ListQuotaRecoveryWindows(ctx, 100)
 	if err != nil {

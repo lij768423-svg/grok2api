@@ -168,6 +168,21 @@ func TestQuotaRefreshFailureUsesBoundedExponentialBackoff(t *testing.T) {
 	}
 }
 
+func TestWebQuotaCooldownSkipsAlreadyQueuedBackgroundProbe(t *testing.T) {
+	service := NewService(nil, nil, nil, nil, nil, nil, nil)
+	now := time.Date(2026, 8, 24, 8, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	service.recordWebQuotaForbidden(context.Background(), 77)
+
+	_, err := service.ProbeQuotaMode(context.Background(), 77, "fast")
+	if !errors.Is(err, provider.ErrQuotaForbidden) {
+		t.Fatalf("probe error = %v, want ErrQuotaForbidden", err)
+	}
+	if retryAfter := provider.ErrorRetryAfter(err); retryAfter < webQuotaForbiddenCooldown {
+		t.Fatalf("probe retry-after = %s, want at least %s", retryAfter, webQuotaForbiddenCooldown)
+	}
+}
+
 func TestRecentConsoleUsageSnapshotSuppressesDuplicateUpstreamRefresh(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "console-refresh-throttle.db"))

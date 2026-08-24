@@ -1889,11 +1889,13 @@ func (m *Manager) ensureClearance(ctx context.Context, scope domain.Scope, node 
 		m.clearanceMu.Unlock()
 		return cookies, userAgent, nil
 	}
-	// Background quota and warmup requests must not turn an upstream challenge
-	// into a browser storm. Keep the stale, binding-matched session for this
-	// request and leave state.invalid set so the next interactive request can
-	// refresh it normally.
-	if cfg.Mode == "on_demand" && forceRefresh && ClearanceSolveSuppressedFromContext(ctx) {
+	// Background quota and warmup requests must never turn an upstream 403 into
+	// a browser storm. This is deliberately independent of the configured
+	// Clearance mode: installations can still have the legacy "flaresolverr"
+	// mode persisted while background workers are running. Keep a matching stale
+	// session when possible, otherwise return the imported session unchanged;
+	// leave state.invalid set so a later interactive request can refresh it.
+	if ClearanceSolveSuppressedFromContext(ctx) {
 		bindingMatches := known && state.userAgent != "" && state.version == version &&
 			state.fingerprint == fingerprint &&
 			(state.bindingFingerprint == "" || state.bindingFingerprint == bindingFingerprint)

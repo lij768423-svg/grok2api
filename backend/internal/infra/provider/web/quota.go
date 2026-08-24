@@ -14,6 +14,7 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -30,6 +31,12 @@ func (a *Adapter) SyncQuota(ctx context.Context, credential account.Credential) 
 	if autoErr == nil {
 		chatWindows = append(chatWindows, autoWindow)
 	} else if errors.Is(autoErr, provider.ErrQuotaForbidden) {
+		if infraegress.ClearanceSolveSuppressedFromContext(ctx) {
+			// A background probe only needs to establish whether the account can
+			// be refreshed. Once the first quota endpoint returns an ordinary 403,
+			// stop the account-wide sync instead of probing fast/imagine/weekly too.
+			return provider.QuotaSnapshot{}, autoErr
+		}
 		backgroundForbidden = true
 	}
 	fastWindow, fastErr := a.SyncQuotaMode(ctx, credential, "fast")
@@ -39,6 +46,9 @@ func (a *Adapter) SyncQuota(ctx context.Context, credential account.Credential) 
 	if fastErr == nil {
 		chatWindows = append(chatWindows, fastWindow)
 	} else if errors.Is(fastErr, provider.ErrQuotaForbidden) {
+		if infraegress.ClearanceSolveSuppressedFromContext(ctx) {
+			return provider.QuotaSnapshot{}, fastErr
+		}
 		backgroundForbidden = true
 	}
 	imagineSnapshot, imagineErr := a.SyncQuotaGroup(ctx, credential, account.QuotaGroupWebImagine)
@@ -348,7 +358,11 @@ func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credenti
 			if provider.IsCloudflareChallengeResponse(response.Header, body) {
 				lease.InvalidateClearance()
 			}
-			if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, endpoint) {
+			// A foreground request may have an outdated signing value, so it gets
+			// one signature retry. A background quota probe is only collecting
+			// cache state; retrying a generic 403 doubles its upstream load without
+			// improving the outcome and used to amplify the startup storm.
+			if attempt == 0 && !infraegress.ClearanceSolveSuppressedFromContext(requestCtx) && a.invalidateSignedStatsig(http.MethodPost, endpoint) {
 				continue
 			}
 		}
