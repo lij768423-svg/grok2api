@@ -469,6 +469,7 @@ func (a *Adapter) WarmStatsig(ctx context.Context, credential account.Credential
 	if a.statsig == nil {
 		return 0, fmt.Errorf("Statsig 签名器未初始化")
 	}
+	ctx = infraegress.WithClearanceSolveSuppressed(ctx)
 	token, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
 	if err != nil {
 		return 0, err

@@ -1889,6 +1889,24 @@ func (m *Manager) ensureClearance(ctx context.Context, scope domain.Scope, node 
 		m.clearanceMu.Unlock()
 		return cookies, userAgent, nil
 	}
+	// Background quota and warmup requests must not turn an upstream challenge
+	// into a browser storm. Keep the stale, binding-matched session for this
+	// request and leave state.invalid set so the next interactive request can
+	// refresh it normally.
+	if cfg.Mode == "on_demand" && forceRefresh && ClearanceSolveSuppressedFromContext(ctx) {
+		bindingMatches := known && state.userAgent != "" && state.version == version &&
+			state.fingerprint == fingerprint &&
+			(state.bindingFingerprint == "" || state.bindingFingerprint == bindingFingerprint)
+		if bindingMatches {
+			state.lastUsedAt = now
+			m.clearances[key] = state
+			cookies, userAgent := state.cookies, state.userAgent
+			m.clearanceMu.Unlock()
+			return cookies, userAgent, nil
+		}
+		m.clearanceMu.Unlock()
+		return existingCookies, existingUserAgent, nil
+	}
 	// A successful browser solve may legitimately return no challenge cookie.
 	// Keep that negative result for a short interval so a stream of ordinary
 	// application 403s cannot relaunch Chromium for the same account/session.

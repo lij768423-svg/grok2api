@@ -2606,6 +2606,65 @@ func TestOnDemandNoChallengeCooldownSurvivesRepeatedChallengeClassification(t *t
 	}
 }
 
+func TestSuppressedOnDemandClearanceDoesNotSolveUntilInteractiveRequest(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &mutableEgressRepository{node: domain.Node{ID: 1, Name: "web", Scope: domain.ScopeWeb, Enabled: true, Health: 1}}
+	solver := &clearanceSolverStub{}
+	manager := NewManager(repository, cipher)
+	manager.solver = solver
+	manager.UpdateClearanceConfig(ClearanceConfig{
+		Mode: "on_demand", FlareSolverrURL: "http://solver", TargetURL: "https://grok.com",
+		Timeout: time.Second, RefreshInterval: time.Hour,
+	})
+
+	initial, err := manager.Acquire(context.Background(), domain.ScopeWeb, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial.InvalidateClearance()
+	initial.Release()
+
+	background, err := manager.Acquire(WithClearanceSolveSuppressed(context.Background()), domain.ScopeWeb, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if solver.calls != 0 || background.CFCookies != "" {
+		t.Fatalf("initial suppressed refresh calls=%d cookies=%q", solver.calls, background.CFCookies)
+	}
+	background.Release()
+
+	interactive, err := manager.Acquire(context.Background(), domain.ScopeWeb, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if solver.calls != 1 || interactive.CFCookies != "cf_clearance=value-1" {
+		t.Fatalf("interactive refresh calls=%d cookies=%q", solver.calls, interactive.CFCookies)
+	}
+	interactive.InvalidateClearance()
+	interactive.Release()
+
+	background, err = manager.Acquire(WithClearanceSolveSuppressed(context.Background()), domain.ScopeWeb, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if solver.calls != 1 || background.CFCookies != "cf_clearance=value-1" {
+		t.Fatalf("suppressed refresh launched solver or lost stale cookie: calls=%d cookies=%q", solver.calls, background.CFCookies)
+	}
+	background.Release()
+
+	interactive, err = manager.Acquire(context.Background(), domain.ScopeWeb, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer interactive.Release()
+	if solver.calls != 2 || interactive.CFCookies != "cf_clearance=value-2" {
+		t.Fatalf("interactive request did not refresh after suppression: calls=%d cookies=%q", solver.calls, interactive.CFCookies)
+	}
+}
+
 func TestClearanceSolveFailureCooldownAvoidsRepeatedSolverCalls(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {

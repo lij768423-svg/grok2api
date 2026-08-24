@@ -18,6 +18,7 @@ import (
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
@@ -3165,6 +3166,7 @@ func (s *Service) RefreshQuotaMode(ctx context.Context, id uint64, mode string) 
 // second event for the same account and mode. The recovery worker owns the
 // current claim and is responsible for acknowledging or rescheduling it.
 func (s *Service) ProbeQuotaMode(ctx context.Context, id uint64, mode string) (accountdomain.QuotaWindow, error) {
+	ctx = infraegress.WithClearanceSolveSuppressed(ctx)
 	mode = strings.TrimSpace(mode)
 	key := quotaSyncKey(id, mode)
 	result, err, _ := s.quotaSyncs.Do(key, func() (any, error) {
@@ -3581,6 +3583,7 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 		}
 		if !skipUpstream && refreshErr == nil && acquired {
 			if err := s.syncPool.Do(ctx, func(workCtx context.Context) error {
+				workCtx = infraegress.WithClearanceSolveSuppressed(workCtx)
 				if refreshMode == accountdomain.QuotaGroupWebImagine {
 					var refreshed quotaRefreshResult
 					refreshed, refreshErr = s.refreshQuotaGroup(workCtx, request.accountID, refreshMode)
@@ -3931,6 +3934,7 @@ func (s *Service) SyncIncompleteConsoleQuotas(ctx context.Context) (int, int, er
 		var batchSucceeded, batchFailed int
 		if len(pending) > 0 {
 			batchSucceeded, batchFailed, err = s.runAccountBatch(ctx, "console_usage_migration", pending, s.syncPool, nil, func(workCtx context.Context, id uint64) error {
+				workCtx = infraegress.WithClearanceSolveSuppressed(workCtx)
 				var release func()
 				if s.refreshLock != nil {
 					var acquired bool
@@ -3998,6 +4002,7 @@ func (s *Service) SyncWebQuotaAccounts(ctx context.Context, ids []uint64) (int, 
 	var rateMu sync.Mutex
 	var nextRequestAt time.Time
 	return s.runAccountBatch(ctx, "web_quota_startup_catchup", ids, pool, nil, func(workCtx context.Context, id uint64) error {
+		workCtx = infraegress.WithClearanceSolveSuppressed(workCtx)
 		if err := waitWebQuotaCatchupTurn(workCtx, &rateMu, &nextRequestAt); err != nil {
 			return err
 		}

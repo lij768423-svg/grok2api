@@ -30,6 +30,7 @@ type traceContextKey struct{}
 type accountContextKey struct{}
 type egressNodeContextKey struct{}
 type qualityProbeContextKey struct{}
+type clearanceSolveSuppressedContextKey struct{}
 
 // WithAccount passes a stable Provider account identity to the egress layer. It is used only to render
 // authentication usernames for sticky proxies such as Resin and is never written to upstream headers or audit.
@@ -97,6 +98,27 @@ func qualityProbeFromContext(ctx context.Context) bool {
 		return false
 	}
 	value, _ := ctx.Value(qualityProbeContextKey{}).(bool)
+	return value
+}
+
+// WithClearanceSolveSuppressed marks a background request that may use a
+// stale browser session but must not launch FlareSolverr. The next interactive
+// request can still observe the invalid state and perform the normal on-demand
+// refresh.
+func WithClearanceSolveSuppressed(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, clearanceSolveSuppressedContextKey{}, true)
+}
+
+// ClearanceSolveSuppressedFromContext reports whether a request is allowed to
+// avoid launching a browser while using a stale Clearance session.
+func ClearanceSolveSuppressedFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	value, _ := ctx.Value(clearanceSolveSuppressedContextKey{}).(bool)
 	return value
 }
 
