@@ -32,8 +32,11 @@ const (
 )
 
 var (
-	errQualityDegraded    = errors.New("上游响应缺少推理")
-	errQualityEmptyStream = errors.New("上游流式响应为空")
+	errQualityDegraded     = errors.New("上游响应缺少推理")
+	errUpstreamStreamEmpty = errors.New("上游流式响应为空")
+	// Keep the old name for quality-hold callers and tests. Empty-stream
+	// recovery is an availability concern even when quality guard is disabled.
+	errQualityEmptyStream = errUpstreamStreamEmpty
 )
 
 // QualityRetryRuntime is the isolated request-path withhold/retry policy.
@@ -330,6 +333,18 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 		state = modeldomain.DefaultQualityGuardModelState(route.Provider, route.UpstreamModel)
 	}
 	return state == modeldomain.QualityGuardModelEnabled
+}
+
+// shouldRecoverEmptyBuildStream covers a different failure class from the
+// quality guard: the Build upstream accepted a streaming request but never
+// produced its first byte. It stays enabled for every new Build stream so an
+// unverified model is still available, while stored responses and forced
+// egress diagnostics retain their pinned routing semantics.
+func shouldRecoverEmptyBuildStream(input Input, ownership *inferencedomain.ResponseOwnership, route modeldomain.Route) bool {
+	return input.Streaming &&
+		ownership == nil &&
+		input.ForcedEgressNodeID == 0 &&
+		route.Provider == accountdomain.ProviderBuild
 }
 
 func qualityRequestHasInFlightToolResults(body []byte) bool {

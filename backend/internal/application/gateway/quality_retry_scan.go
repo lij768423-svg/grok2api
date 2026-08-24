@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
 const (
@@ -464,4 +465,51 @@ func newPrefixReplay(held *bytes.Buffer, rest io.ReadCloser) io.ReadCloser {
 		return rest
 	}
 	return &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(held.Bytes()), rest), source: rest}
+}
+
+// peekInitialStream withholds only enough of an SSE body to determine whether
+// the upstream emitted its first byte. This is deliberately separate from the
+// quality scanner: availability recovery must also work for models whose
+// quality guard is disabled or unverified.
+//
+// Once a byte is observed the pump remains the continuation reader, so the
+// caller can hand the response off without replaying a request after partial
+// output has become visible.
+func peekInitialStream(ctx context.Context, body io.ReadCloser) (io.ReadCloser, bool, error) {
+	if body == nil {
+		return io.NopCloser(bytes.NewReader(nil)), false, errUpstreamStreamEmpty
+	}
+	pump := newQualityReadPump(body)
+	var held bytes.Buffer
+	for {
+		select {
+		case <-ctx.Done():
+			_ = pump.Close()
+			return io.NopCloser(bytes.NewReader(held.Bytes())), false, qualityPeekAbortError(ctx, ctx.Err())
+		case result, ok := <-pump.results:
+			if !ok {
+				_ = pump.Close()
+				return io.NopCloser(bytes.NewReader(held.Bytes())), false, errUpstreamStreamEmpty
+			}
+			if len(result.data) > 0 {
+				_, _ = held.Write(result.data)
+				// Keep result.err (including EOF or an idle timeout) in the
+				// pump so it is surfaced only after the buffered bytes.
+				if result.err != nil {
+					pump.finalErr = result.err
+				}
+				return newPrefixReplay(&held, pump), true, nil
+			}
+			if result.err != nil {
+				_ = pump.Close()
+				if result.err == io.EOF {
+					return io.NopCloser(bytes.NewReader(held.Bytes())), false, errUpstreamStreamEmpty
+				}
+				if neterrorpkg.IsUpstreamStreamIdleTimeout(result.err) {
+					return io.NopCloser(bytes.NewReader(held.Bytes())), false, result.err
+				}
+				return io.NopCloser(bytes.NewReader(held.Bytes())), false, qualityPeekAbortError(ctx, result.err)
+			}
+		}
+	}
 }

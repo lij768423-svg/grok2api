@@ -1020,6 +1020,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	authRecoveryAttempted := make(map[uint64]bool)
 	holdCfg := s.qualityRetryConfig()
 	qualityHoldEnabled := shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
+	emptyBuildStreamRecovery := shouldRecoverEmptyBuildStream(input, ownership, route)
 	// Count accounts that actually reached the upstream. Credential-only skips
 	// do not consume the quality retry budget; refreshes stay on the same account.
 	qualityAccountAttempts := 0
@@ -1514,6 +1515,53 @@ attemptLoop:
 			continue
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			// A Build response can send successful HTTP headers and then remain
+			// completely silent until the stream-idle deadline. Do not commit those
+			// headers to the client: with no bytes exposed, one account replacement
+			// is safe and avoids turning an otherwise recoverable attempt into a
+			// downstream Responses server_error. Quality-held streams already perform
+			// the same empty-stream recovery below, so avoid nesting two read pumps.
+			if emptyBuildStreamRecovery && !qualityHoldEnabled {
+				replay, received, peekErr := peekInitialStream(ctx, response.Body)
+				if peekErr != nil || !received {
+					if peekErr == nil {
+						peekErr = errUpstreamStreamEmpty
+					}
+					failureAttempts.captureStreamTransportFailure(credential, responseStartedAt, response, peekErr)
+					if replay != nil {
+						_ = replay.Close()
+					} else {
+						_ = response.Body.Close()
+					}
+					lease.completeSelectorObservation(false)
+					lease.Release()
+					lastErr = peekErr
+					if isClientRequestCancel(ctx, peekErr) {
+						lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), peekErr)}
+						break
+					}
+					lastFailure = newTransportUpstreamFailure(peekErr, credential.ID, credential.Name)
+					idleOrEmpty := neterrorpkg.IsUpstreamStreamIdleTimeout(peekErr) || errors.Is(peekErr, errUpstreamStreamEmpty)
+					writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+					cooldown := time.Duration(0)
+					status := 0
+					if idleOrEmpty {
+						status = http.StatusGatewayTimeout
+						cooldown = holdCfg.IdleAccountCooldown
+					}
+					if markErr := s.selector.MarkFailureAfterSuccess(writeCtx, credential, status, cooldown); markErr != nil {
+						s.logger.Warn("build_initial_stream_failure_cooldown_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", markErr)
+					} else {
+						s.logger.Warn("build_initial_stream_retry", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "error", lastFailure.Code, "cooldown", cooldown)
+					}
+					writeCancel()
+					if shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
+						break
+					}
+					continue
+				}
+				response.Body = replay
+			}
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			if qualityHoldEnabled {
 				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)

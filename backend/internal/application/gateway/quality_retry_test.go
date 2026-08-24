@@ -629,6 +629,57 @@ func TestPeekQualityStreamEmptyEOFRequestsAnotherAccount(t *testing.T) {
 	}
 }
 
+type initialStreamErrorBody struct {
+	err error
+}
+
+func (b initialStreamErrorBody) Read([]byte) (int, error) { return 0, b.err }
+func (b initialStreamErrorBody) Close() error             { return nil }
+
+func TestPeekInitialStreamOnlyRetriesBeforeFirstByte(t *testing.T) {
+	t.Parallel()
+
+	replay, received, err := peekInitialStream(context.Background(), io.NopCloser(strings.NewReader("data: first\n\n")))
+	if err != nil || !received {
+		t.Fatalf("initial stream peek = received=%v err=%v, want bytes", received, err)
+	}
+	body, readErr := io.ReadAll(replay)
+	_ = replay.Close()
+	if readErr != nil || string(body) != "data: first\n\n" {
+		t.Fatalf("replayed body=%q readErr=%v", body, readErr)
+	}
+
+	replay, received, err = peekInitialStream(context.Background(), io.NopCloser(strings.NewReader("")))
+	if received || !errors.Is(err, errUpstreamStreamEmpty) {
+		t.Fatalf("empty stream peek = received=%v err=%v, want empty error", received, err)
+	}
+	_ = replay.Close()
+
+	replay, received, err = peekInitialStream(context.Background(), initialStreamErrorBody{err: neterrorpkg.ErrUpstreamStreamIdleTimeout})
+	if received || !neterrorpkg.IsUpstreamStreamIdleTimeout(err) {
+		t.Fatalf("idle stream peek = received=%v err=%v, want idle error", received, err)
+	}
+	_ = replay.Close()
+}
+
+func TestShouldRecoverEmptyBuildStreamIsIndependentFromQualityPolicy(t *testing.T) {
+	t.Parallel()
+	input := Input{Streaming: true, PublicModel: "grok-4.6"}
+	build := modeldomain.Route{Provider: accountdomain.ProviderBuild, UpstreamModel: "grok-4.6"}
+	if !shouldRecoverEmptyBuildStream(input, nil, build) {
+		t.Fatal("Build streaming must enable initial-byte recovery")
+	}
+	console := build
+	console.Provider = accountdomain.ProviderConsole
+	if shouldRecoverEmptyBuildStream(input, nil, console) {
+		t.Fatal("Console streaming must not use Build initial-byte recovery")
+	}
+	owned := inferencedomain.ResponseOwnership{AccountID: 1}
+	if shouldRecoverEmptyBuildStream(input, &owned, build) {
+		t.Fatal("stored responses must retain pinned routing")
+	}
+}
+
 func TestPeekQualityStreamProcessesUnterminatedFinalEvent(t *testing.T) {
 	t.Parallel()
 	body := io.NopCloser(strings.NewReader(`data: {"type":"response.output_text.delta","delta":"ok"}`))

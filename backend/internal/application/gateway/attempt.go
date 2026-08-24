@@ -171,6 +171,33 @@ func (r *failureAttemptRecorder) captureStreamFailure(credential accountdomain.C
 	})
 }
 
+// captureStreamTransportFailure records a stream that failed after successful
+// response headers but before any downstream bytes were delivered. Keeping it
+// in Attempts makes account failover visible in the audit row without storing
+// an upstream body that does not exist.
+func (r *failureAttemptRecorder) captureStreamTransportFailure(credential accountdomain.Credential, startedAt time.Time, response *provider.Response, err error) {
+	if response == nil || err == nil {
+		return
+	}
+	statusCode := response.StatusCode
+	r.append(audit.Attempt{
+		Source:             audit.AttemptSourceUpstreamHTTP,
+		Stage:              "response_stream",
+		AccountID:          auditAccountID(credential.ID),
+		AccountName:        credential.Name,
+		Method:             r.method,
+		RequestPath:        r.path,
+		UpstreamURL:        sanitizeUpstreamURL(response.UpstreamURL),
+		StartedAt:          startedAt.UTC(),
+		DurationMS:         time.Since(startedAt).Milliseconds(),
+		UpstreamStatusCode: &statusCode,
+		UpstreamStatus:     response.Status,
+		ResponseHeaders:    sanitizeDiagnosticHeaders(response.Header),
+		TransportError:     sanitizeDiagnosticText(err.Error(), diagnosticTextLimit),
+		ErrorChain:         errorFrames(err),
+	})
+}
+
 func (r *failureAttemptRecorder) captureQualityDegraded(credential accountdomain.Credential, startedAt time.Time) {
 	status := http.StatusOK
 	r.append(audit.Attempt{
