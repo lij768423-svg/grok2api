@@ -79,6 +79,18 @@ export function listModelGroups(input: ListModelsInput): Promise<PaginatedDTO<Mo
   return apiRequest(`/api/admin/v1/models/groups?${query}`, {}, decodeModelGroupPage);
 }
 
+export async function listAllModelGroups(input: Omit<ListModelsInput, "page" | "pageSize"> = {}): Promise<PaginatedDTO<ModelRouteGroupDTO>> {
+  const pageSize = 2000;
+  const first = await listModelGroups({ ...input, page: 1, pageSize });
+  const items = [...first.items];
+  for (let page = 2; items.length < first.total; page += 1) {
+    const next = await listModelGroups({ ...input, page, pageSize });
+    if (next.items.length === 0) break;
+    items.push(...next.items);
+  }
+  return { ...first, items, page: 1, pageSize, total: items.length };
+}
+
 type ModelSyncEventDTO = {
   synced?: number;
   completed?: number;
