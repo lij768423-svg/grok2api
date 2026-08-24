@@ -2552,6 +2552,60 @@ func TestCookieLessClearanceCooldownSurvivesRefreshIntervalExpiry(t *testing.T) 
 	}
 }
 
+func TestOnDemandNoChallengeCooldownSurvivesRepeatedChallengeClassification(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &mutableEgressRepository{node: domain.Node{ID: 1, Name: "web", Scope: domain.ScopeWeb, Enabled: true, Health: 1}}
+	solver := &clearanceSolverStub{noCookies: true}
+	manager := NewManager(repository, cipher)
+	manager.solver = solver
+	manager.UpdateClearanceConfig(ClearanceConfig{
+		Mode: "on_demand", FlareSolverrURL: "http://solver", TargetURL: "https://grok.com",
+		Timeout: time.Second, RefreshInterval: time.Hour,
+	})
+
+	initial, err := manager.Acquire(context.Background(), domain.ScopeWeb, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if solver.calls != 0 {
+		t.Fatalf("on-demand initial lease called solver %d times", solver.calls)
+	}
+	initial.InvalidateClearance()
+	initial.Release()
+
+	refreshed, err := manager.Acquire(context.Background(), domain.ScopeWeb, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if solver.calls != 1 || refreshed.CFCookies != "" || refreshed.UserAgent != "Chrome/146 test" {
+		t.Fatalf("first challenge refresh calls=%d lease=%#v", solver.calls, refreshed)
+	}
+	refreshed.InvalidateClearance()
+	refreshed.Release()
+
+	// Both request-level and administrator-level invalidation must retain the
+	// short negative cache after a solver reported no challenge.
+	manager.InvalidateClearance(1)
+
+	for range 2 {
+		lease, acquireErr := manager.Acquire(context.Background(), domain.ScopeWeb, "account")
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		if lease.CFCookies != "" || lease.UserAgent != "Chrome/146 test" {
+			t.Fatalf("negative-cache lease=%#v", lease)
+		}
+		lease.InvalidateClearance()
+		lease.Release()
+	}
+	if solver.calls != 1 {
+		t.Fatalf("repeated challenge classifications relaunched solver %d times", solver.calls)
+	}
+}
+
 func TestClearanceSolveFailureCooldownAvoidsRepeatedSolverCalls(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {

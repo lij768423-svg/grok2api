@@ -189,6 +189,7 @@ type clearanceState struct {
 	userAgent          string
 	refreshedAt        time.Time
 	invalid            bool
+	noChallenge        bool
 	used               bool
 	version            uint64
 	fingerprint        string
@@ -1835,10 +1836,18 @@ func (m *Manager) ensureClearance(ctx context.Context, scope domain.Scope, node 
 		if !known {
 			m.ensureClearanceCacheCapacityLocked()
 		}
+		noChallenge := strings.TrimSpace(existingCookies) == "" && strings.TrimSpace(existingUserAgent) != ""
+		var solveBackoffUntil time.Time
+		if noChallenge && node.ClearanceRefreshedAt != nil {
+			candidate := node.ClearanceRefreshedAt.Add(clearanceNoChallengeCooldown)
+			if candidate.After(now) {
+				solveBackoffUntil = candidate
+			}
+		}
 		state = clearanceState{
 			cookies: existingCookies, userAgent: existingUserAgent, used: true, version: version,
 			fingerprint: node.ClearanceFingerprint, bindingFingerprint: node.ClearanceBindingFingerprint,
-			lastUsedAt: now,
+			lastUsedAt: now, noChallenge: noChallenge, solveBackoffUntil: solveBackoffUntil,
 		}
 		if node.ClearanceRefreshedAt != nil {
 			state.refreshedAt = *node.ClearanceRefreshedAt
@@ -1863,6 +1872,23 @@ func (m *Manager) ensureClearance(ctx context.Context, scope domain.Scope, node 
 		(state.bindingFingerprint == "" || state.bindingFingerprint == bindingFingerprint)
 	fallback := clearanceSolution{Cookies: state.cookies, UserAgent: state.userAgent}
 	forceRefresh := known && state.invalid
+	// In on-demand mode a solver response without a challenge is a negative
+	// cache, not a failed Clearance. Keep serving that session while the short
+	// cooldown is active, even when the caller classified another 403 as a
+	// challenge. This prevents ordinary account/application responses from
+	// relaunching Chromium repeatedly for the same Resin identity.
+	noChallengeCooldown := cfg.Mode == "on_demand" && known && state.noChallenge &&
+		state.userAgent != "" && state.version == version && state.fingerprint == fingerprint &&
+		(state.bindingFingerprint == "" || state.bindingFingerprint == bindingFingerprint) &&
+		!state.solveBackoffUntil.IsZero() && now.Before(state.solveBackoffUntil)
+	if noChallengeCooldown {
+		state.invalid = false
+		state.lastUsedAt = now
+		m.clearances[key] = state
+		cookies, userAgent := state.cookies, state.userAgent
+		m.clearanceMu.Unlock()
+		return cookies, userAgent, nil
+	}
 	// A successful browser solve may legitimately return no challenge cookie.
 	// Keep that negative result for a short interval so a stream of ordinary
 	// application 403s cannot relaunch Chromium for the same account/session.
@@ -2051,6 +2077,7 @@ func (m *Manager) cacheClearance(key string, solution clearanceSolution, refresh
 		used: true, version: version, fingerprint: fingerprint, bindingFingerprint: bindingFingerprint, lastUsedAt: now,
 	}
 	if strings.TrimSpace(solution.Cookies) == "" {
+		state.noChallenge = true
 		state.solveBackoffUntil = now.Add(clearanceNoChallengeCooldown)
 	}
 	m.clearances[key] = state
@@ -2083,6 +2110,7 @@ func (m *Manager) markClearanceSolveBackoff(key string, until time.Time) {
 	m.clearanceMu.Lock()
 	state := m.clearances[key]
 	state.solveBackoffUntil = until
+	state.noChallenge = false
 	state.lastUsedAt = time.Now().UTC()
 	m.clearances[key] = state
 	m.clearanceMu.Unlock()
@@ -2208,6 +2236,7 @@ func (m *Manager) RefreshClearance(ctx context.Context, nodeID uint64) error {
 
 func (m *Manager) InvalidateClearance(nodeID uint64) {
 	m.clearanceMu.Lock()
+	now := time.Now().UTC()
 	prefix := "node:" + strconv.FormatUint(nodeID, 10)
 	if nodeID == 0 {
 		prefix = "direct"
@@ -2216,9 +2245,14 @@ func (m *Manager) InvalidateClearance(nodeID uint64) {
 		if key == prefix || strings.HasPrefix(key, prefix+":") {
 			state.invalid = true
 			state.used = true
-			// A newly observed challenge is stronger evidence than a previous
-			// solver failure, so it explicitly overrides the short retry backoff.
-			state.solveBackoffUntil = time.Time{}
+			preserveNoChallenge := m.clearanceConfig.Mode == "on_demand" && state.noChallenge &&
+				!state.solveBackoffUntil.IsZero() && now.Before(state.solveBackoffUntil)
+			if !preserveNoChallenge {
+				// A newly observed challenge is stronger evidence than a previous
+				// solver failure, so it explicitly overrides the short retry backoff.
+				state.solveBackoffUntil = time.Time{}
+				state.noChallenge = false
+			}
 			m.clearances[key] = state
 		}
 	}
@@ -2307,10 +2341,16 @@ func (m *Manager) invalidateClearanceKey(key string, client requestClient) {
 	state := m.clearances[key]
 	state.invalid = true
 	state.used = true
-	// A newly classified challenge must be able to retry immediately even if a
-	// previous solve failed. Subsequent failures repopulate this backoff.
-	state.solveBackoffUntil = time.Time{}
-	state.lastUsedAt = time.Now().UTC()
+	now := time.Now().UTC()
+	preserveNoChallenge := m.clearanceConfig.Mode == "on_demand" && state.noChallenge &&
+		!state.solveBackoffUntil.IsZero() && now.Before(state.solveBackoffUntil)
+	if !preserveNoChallenge {
+		// A newly classified challenge must be able to retry immediately even if a
+		// previous solve failed. Subsequent failures repopulate this backoff.
+		state.solveBackoffUntil = time.Time{}
+		state.noChallenge = false
+	}
+	state.lastUsedAt = now
 	m.clearances[key] = state
 	m.clearanceMu.Unlock()
 	if client != nil {
