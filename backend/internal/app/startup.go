@@ -26,6 +26,7 @@ const (
 	consoleUsageMigrationRetry = 5 * time.Minute
 	modelCatalogStaleAfter     = 24 * time.Hour
 	modelCatalogCatchupEvery   = 6 * time.Hour
+	webQuotaCatchupBatchSize   = 100
 )
 
 type startupReport struct {
@@ -375,22 +376,6 @@ func (a *Application) runStatsigWarmup(ctx context.Context) {
 	}
 }
 
-func (a *Application) queueDueWebQuotaRefresh(ctx context.Context) {
-	windows, err := a.accounts.ListDueWebQuotaWindows(ctx, time.Now().UTC(), 1000)
-	if err != nil {
-		a.logger.Warn("web_quota_startup_catchup_failed", "error", err)
-		a.startup.recordError(err)
-		return
-	}
-	for _, window := range windows {
-		a.accounts.QueueQuotaRefresh(window.AccountID, window.Mode)
-	}
-	a.startup.updateReport(func(report *startupReport) { report.DueWebQuotasQueued = len(windows) })
-	if len(windows) > 0 {
-		a.logger.Info("web_quota_startup_catchup_queued", "count", len(windows))
-	}
-}
-
 func (a *Application) runWebQuotaCatchup(ctx context.Context) {
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
@@ -400,22 +385,65 @@ func (a *Application) runWebQuotaCatchup(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		ids, err := a.accountRepo.ListStaleWebQuotaAccountIDs(ctx, time.Now().UTC().Add(-webQuotaStaleAfter), 100)
-		if err == nil && len(ids) > 0 {
-			runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-			var succeeded int
-			succeeded, _, err = a.accounts.SyncWebQuotaAccounts(runCtx, ids)
-			cancel()
-			a.startup.updateReport(func(report *startupReport) {
-				report.StaleWebQuotasFound = len(ids)
-				report.StaleWebQuotasSynced = succeeded
-			})
+		now := time.Now().UTC()
+		dueIDs, dueErr := a.accountRepo.ListDueWebQuotaAccountIDs(ctx, now, webQuotaCatchupBatchSize)
+		if dueErr != nil && ctx.Err() == nil {
+			a.logger.Warn("web_quota_due_catchup_failed", "error", dueErr)
+			a.startup.recordError(dueErr)
 		}
-		if err != nil && ctx.Err() == nil {
-			a.logger.Warn("web_quota_stale_catchup_failed", "error", err)
+		staleIDs, staleErr := a.accountRepo.ListStaleWebQuotaAccountIDs(ctx, now.Add(-webQuotaStaleAfter), webQuotaCatchupBatchSize)
+		if staleErr != nil && ctx.Err() == nil {
+			a.logger.Warn("web_quota_stale_catchup_failed", "error", staleErr)
+			a.startup.recordError(staleErr)
+		}
+		ids := mergeWebQuotaCatchupIDs(dueIDs, staleIDs, webQuotaCatchupBatchSize)
+		var succeeded int
+		var syncErr error
+		if len(ids) > 0 {
+			runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			succeeded, _, syncErr = a.accounts.SyncWebQuotaAccounts(runCtx, ids)
+			cancel()
+		}
+		a.startup.updateReport(func(report *startupReport) {
+			report.DueWebQuotasQueued = len(dueIDs)
+			report.StaleWebQuotasFound = len(staleIDs)
+			report.StaleWebQuotasSynced = succeeded
+		})
+		if syncErr != nil && ctx.Err() == nil {
+			a.logger.Warn("web_quota_catchup_sync_failed", "accounts", len(ids), "error", syncErr)
+		}
+		if len(ids) > 0 {
+			a.logger.Info("web_quota_catchup_selected", "due_accounts", len(dueIDs), "stale_accounts", len(staleIDs), "unique_accounts", len(ids))
 		}
 		resetTimer(timer, webQuotaCatchupEvery)
 	}
+}
+
+// mergeWebQuotaCatchupIDs gives due accounts priority, then fills the batch
+// with stale accounts while suppressing duplicates. A complete Web sync is
+// account-scoped, so adding another expired window must never add another task.
+func mergeWebQuotaCatchupIDs(dueIDs, staleIDs []uint64, limit int) []uint64 {
+	if limit <= 0 {
+		return nil
+	}
+	result := make([]uint64, 0, min(limit, len(dueIDs)+len(staleIDs)))
+	seen := make(map[uint64]struct{}, len(dueIDs)+len(staleIDs))
+	for _, ids := range [][]uint64{dueIDs, staleIDs} {
+		for _, id := range ids {
+			if id == 0 {
+				continue
+			}
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			seen[id] = struct{}{}
+			result = append(result, id)
+			if len(result) == limit {
+				return result
+			}
+		}
+	}
+	return result
 }
 
 func (a *Application) runConsoleUsageMigration(ctx context.Context) {

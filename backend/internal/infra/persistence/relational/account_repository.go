@@ -1423,6 +1423,9 @@ func saveAccountRelations(tx *gorm.DB, value account.Credential, accountID uint6
 		if profile.TermsAcceptedVersion > 0 {
 			updates = append(updates, "terms_accepted_version")
 		}
+		if profile.QuotaRetryAfter != nil {
+			updates = append(updates, "quota_retry_after")
+		}
 		if profile.BirthDateSetAt != nil {
 			updates = append(updates, "birth_date_set_at")
 		}
@@ -2494,7 +2497,17 @@ func (r *AccountRepository) ListDueQuotaWindows(ctx context.Context, now time.Ti
 		limit = 100
 	}
 	var rows []quotaWindowModel
-	if err := r.db.db.WithContext(ctx).Where("remaining = 0 AND reset_at IS NOT NULL AND reset_at <= ?", now).Order("reset_at ASC, account_id ASC").Limit(limit).Find(&rows).Error; err != nil {
+	query := r.db.db.WithContext(ctx).
+		Table("account_quota_windows AS quota").
+		Joins("LEFT JOIN provider_accounts AS provider_account ON provider_account.id = quota.account_id").
+		Joins("LEFT JOIN web_account_profiles AS web_profile ON web_profile.account_id = quota.account_id").
+		Where("quota.remaining = 0 AND quota.reset_at IS NOT NULL AND quota.reset_at <= ?", now).
+		// A normal Web quota 403 is a product rejection, not a reason to keep
+		// probing the account every recovery tick. Build/Console rows retain
+		// their existing due-window behavior, and deleted rows remain visible for
+		// the caller's normal provider filtering.
+		Where("provider_account.provider IS NULL OR provider_account.provider <> ? OR web_profile.quota_retry_after IS NULL OR web_profile.quota_retry_after <= ?", account.ProviderWeb, now)
+	if err := query.Select("quota.*").Order("quota.reset_at ASC, quota.account_id ASC").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	values := make([]account.QuotaWindow, 0, len(rows))
@@ -2504,12 +2517,47 @@ func (r *AccountRepository) ListDueQuotaWindows(ctx context.Context, now time.Ti
 	return values, nil
 }
 
+// ListDueWebQuotaAccountIDs collapses all due windows to one active Web account.
+// A full Web quota sync already refreshes the account's chat and media windows;
+// queueing each window separately multiplies upstream requests and bypasses the
+// dedicated, throttled catch-up pool.
+func (r *AccountRepository) ListDueWebQuotaAccountIDs(ctx context.Context, now time.Time, limit int) ([]uint64, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	var ids []uint64
+	err := r.db.db.WithContext(ctx).
+		Table("provider_accounts AS account").
+		Select("account.id").
+		Joins("INNER JOIN account_quota_windows AS quota ON quota.account_id = account.id").
+		Joins("LEFT JOIN web_account_profiles AS profile ON profile.account_id = account.id").
+		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ?", account.ProviderWeb, true, account.AuthStatusActive).
+		Where("quota.remaining = 0 AND quota.reset_at IS NOT NULL AND quota.reset_at <= ?", now).
+		Where("profile.quota_retry_after IS NULL OR profile.quota_retry_after <= ?", now).
+		Group("account.id").
+		Order("MIN(quota.reset_at) ASC, account.id ASC").
+		Limit(limit).
+		Scan(&ids).Error
+	return ids, err
+}
+
 func (r *AccountRepository) ListQuotaRecoveryWindows(ctx context.Context, limit int) ([]account.QuotaWindow, error) {
 	if limit <= 0 || limit > 100000 {
 		limit = 100000
 	}
 	var rows []quotaWindowModel
-	if err := r.db.db.WithContext(ctx).Where("remaining = 0 AND reset_at IS NOT NULL").Order("reset_at ASC, account_id ASC").Limit(limit).Find(&rows).Error; err != nil {
+	now := time.Now().UTC()
+	query := r.db.db.WithContext(ctx).
+		Table("account_quota_windows AS quota").
+		Joins("LEFT JOIN provider_accounts AS provider_account ON provider_account.id = quota.account_id").
+		Joins("LEFT JOIN web_account_profiles AS web_profile ON web_profile.account_id = quota.account_id").
+		Where("quota.remaining = 0 AND quota.reset_at IS NOT NULL").
+		// Startup reconstructs the recovery queue from persisted quota windows.
+		// Keep accounts that received a background-only ordinary 403 out of that
+		// reconstruction until their cooldown expires; otherwise every restart
+		// would immediately recreate the probe storm we just suppressed.
+		Where("provider_account.provider IS NULL OR provider_account.provider <> ? OR web_profile.quota_retry_after IS NULL OR web_profile.quota_retry_after <= ?", account.ProviderWeb, now)
+	if err := query.Select("quota.*").Order("quota.reset_at ASC, quota.account_id ASC").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	values := make([]account.QuotaWindow, 0, len(rows))
@@ -2525,17 +2573,43 @@ func (r *AccountRepository) ListStaleWebQuotaAccountIDs(ctx context.Context, bef
 		limit = 100
 	}
 	var ids []uint64
+	now := time.Now().UTC()
 	err := r.db.db.WithContext(ctx).
 		Table("provider_accounts AS account").
 		Select("account.id").
 		Joins("LEFT JOIN account_quota_windows AS quota ON quota.account_id = account.id").
-		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ?", account.ProviderWeb, true, account.AuthStatusActive).
+		Joins("LEFT JOIN web_account_profiles AS profile ON profile.account_id = account.id").
+		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ? AND (profile.quota_retry_after IS NULL OR profile.quota_retry_after <= ?)", account.ProviderWeb, true, account.AuthStatusActive, now).
 		Group("account.id").
 		Having("MAX(quota.synced_at) IS NULL OR MAX(quota.synced_at) < ?", before.UTC()).
 		Order("MIN(quota.synced_at) ASC, account.id ASC").
 		Limit(limit).
 		Scan(&ids).Error
 	return ids, err
+}
+
+// MarkWebQuotaSyncCooldown records a background-only cooldown for ordinary
+// quota 403 responses. It creates the lightweight Web profile when an account
+// has never had a quota snapshot, and never changes routing/auth state.
+func (r *AccountRepository) MarkWebQuotaSyncCooldown(ctx context.Context, accountID uint64, retryAt time.Time) error {
+	if accountID == 0 || retryAt.IsZero() {
+		return repository.ErrConflict
+	}
+	retryAt = retryAt.UTC()
+	profile := webAccountProfileModel{AccountID: accountID, Tier: string(account.WebTierAuto), QuotaRetryAfter: &retryAt}
+	return r.db.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "account_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"quota_retry_after"}),
+	}).Create(&profile).Error
+}
+
+// ClearWebQuotaSyncCooldown is called after any successful Web quota write.
+func (r *AccountRepository) ClearWebQuotaSyncCooldown(ctx context.Context, accountID uint64) error {
+	if accountID == 0 {
+		return repository.ErrConflict
+	}
+	return r.db.db.WithContext(ctx).Model(&webAccountProfileModel{}).
+		Where("account_id = ?", accountID).Update("quota_retry_after", nil).Error
 }
 
 func toQuotaWindowDomain(row quotaWindowModel) account.QuotaWindow {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
+	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -24,6 +25,7 @@ import (
 
 type Handler struct {
 	service         *egressapp.Service
+	settings        *settingsapp.Service
 	guardStatePath  string
 	guardConfigPath string
 	guardProbe      egressapp.QualityProbeInput
@@ -49,6 +51,14 @@ func (h *Handler) WithQualityGuardProbe(input egressapp.QualityProbeInput) *Hand
 	return h
 }
 
+// WithSettings connects the admin-only Console request-retry control to the
+// main gateway runtime settings. It deliberately does not use the sidecar's
+// file-backed probe policy.
+func (h *Handler) WithSettings(service *settingsapp.Service) *Handler {
+	h.settings = service
+	return h
+}
+
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/egress-proxy-profiles", h.listProxyProfiles)
 	router.GET("/egress-proxy-profiles/:id", h.getProxyProfile)
@@ -68,6 +78,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/egress-nodes/:id/quality-test", h.testQuality)
 	router.GET("/egress-quality-guard", h.qualityGuardStatus)
 	router.PUT("/egress-quality-guard/config", h.updateQualityGuardConfig)
+	router.PUT("/egress-quality-guard/request-retry", h.updateConsoleQualityRetry)
 	router.GET("/egress-quality-guard/profiles", h.listQualityGuardProfiles)
 	router.POST("/egress-quality-guard/profiles", h.createQualityGuardProfile)
 	router.PUT("/egress-quality-guard/profiles/:id", h.updateQualityGuardProfile)
@@ -186,9 +197,10 @@ type qualityGuardEvent struct {
 }
 
 func (h *Handler) qualityGuardStatus(c *gin.Context) {
+	requestRetry := h.requestRetryStatus()
 	state, available, err := h.readQualityGuardState()
 	if !available {
-		response.Success(c, http.StatusOK, gin.H{"available": false})
+		response.Success(c, http.StatusOK, gin.H{"available": false, "requestRetry": requestRetry})
 		return
 	}
 	if err != nil {
@@ -211,7 +223,8 @@ func (h *Handler) qualityGuardStatus(c *gin.Context) {
 			"min_healthy_nodes": state.Guard.MinHealthyNodes, "max_output_tokens": state.Guard.MaxOutputTokens,
 			"fail_closed": state.Guard.FailClosed, "min_generation_ms": state.Guard.MinGenerationMS,
 		},
-		"nodes": state.Nodes, "protectedNodeIds": state.ProtectedNodeIDs, "recentEvents": state.RecentEvents,
+		"requestRetry": requestRetry,
+		"nodes":        state.Nodes, "protectedNodeIds": state.ProtectedNodeIDs, "recentEvents": state.RecentEvents,
 	}
 	if state.Statistics.StartedAt > 0 {
 		payload["statistics"] = state.Statistics
@@ -221,6 +234,44 @@ func (h *Handler) qualityGuardStatus(c *gin.Context) {
 		payload["profiles"] = profiles.summaries()
 	}
 	response.Success(c, http.StatusOK, payload)
+}
+
+func (h *Handler) requestRetryStatus() gin.H {
+	if h.settings == nil {
+		return gin.H{"enabled": false, "consoleEnabled": false, "editable": false}
+	}
+	state := h.settings.QualityRetry()
+	return gin.H{"enabled": state.Enabled, "consoleEnabled": state.ConsoleEnabled, "editable": true}
+}
+
+type consoleQualityRetryRequest struct {
+	ConsoleEnabled *bool `json:"consoleEnabled"`
+}
+
+func (h *Handler) updateConsoleQualityRetry(c *gin.Context) {
+	if h.settings == nil {
+		response.Error(c, http.StatusServiceUnavailable, "qualityGuardReadOnly", "Console 重试策略当前只读")
+		return
+	}
+	var request consoleQualityRetryRequest
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil || request.ConsoleEnabled == nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	state, err := h.settings.UpdateConsoleQualityRetry(c.Request.Context(), *request.ConsoleEnabled)
+	if err != nil {
+		if errors.Is(err, settingsapp.ErrConflict) {
+			response.Error(c, http.StatusConflict, "settingsConflict", "设置已被其他会话更新，请刷新后重试")
+			return
+		}
+		response.Error(c, http.StatusInternalServerError, "qualityGuardConfigWriteFailed", "Console 重试策略保存失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"enabled": state.Enabled, "consoleEnabled": state.ConsoleEnabled, "editable": true,
+	})
 }
 
 type qualityGuardConfigRequest struct {

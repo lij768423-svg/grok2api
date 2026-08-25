@@ -286,7 +286,9 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 						}},
 					}, nil
 				}
-				lease.InvalidateClearance()
+				if provider.IsCloudflareChallengeResponse(upstream.Header, body) {
+					lease.InvalidateClearance()
+				}
 				if statsigTarget != "" && attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
 					lease.Release()
 					continue

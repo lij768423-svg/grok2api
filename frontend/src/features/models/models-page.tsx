@@ -21,8 +21,8 @@ import { Switch } from "@/components/ui/switch";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { createModel, deleteModel, deleteModels, listModelAccountOptions, listModelGroups, syncModels, updateModel, updateModelsEnabled } from "@/entities/model/model-api";
-import type { ModelEndpointCapability, ModelRouteDTO, ModelRouteGroupDTO } from "@/entities/model/types";
+import { createModel, deleteModel, deleteModels, listModelAccountOptions, listModelGroups, syncModels, updateModel, updateModelQualityGuard, updateModelsEnabled } from "@/entities/model/model-api";
+import type { ModelEndpointCapability, ModelRouteDTO, ModelRouteGroupDTO, QualityGuardModelState } from "@/entities/model/types";
 import { EmptyState, ErrorState, TableLoadingRow } from "@/shared/components/data-state";
 import { DataTableShell } from "@/shared/components/data-table-shell";
 import { DataTableFilters } from "@/shared/components/data-table-filters";
@@ -57,15 +57,17 @@ export function ModelsPage() {
     upstreamModel: z.string().min(1, t("errors.required")),
     capability: z.enum(["responses", "chat", "image", "image_edit", "video", "tts", "stt", "realtime"]),
     enabled: z.boolean(),
+    qualityGuardState: z.enum(["enabled", "disabled", "unknown"]),
     bindingMode: z.boolean(),
     accountIds: z.array(z.string()),
   }).refine((value) => !value.bindingMode || value.accountIds.length > 0, { path: ["accountIds"], message: t("models.selectAccountRequired") });
   type ModelForm = z.infer<typeof schema>;
   const form = useForm<ModelForm>({
     resolver: zodResolver(schema),
-    defaultValues: { publicId: "", provider: "grok_build", upstreamModel: "", capability: "responses", enabled: true, bindingMode: false, accountIds: [] },
+    defaultValues: { publicId: "", provider: "grok_build", upstreamModel: "", capability: "responses", enabled: true, qualityGuardState: "unknown", bindingMode: false, accountIds: [] },
   });
   const modelEnabled = useWatch({ control: form.control, name: "enabled" });
+  const qualityGuardState = useWatch({ control: form.control, name: "qualityGuardState" });
   const selectedProvider = useWatch({ control: form.control, name: "provider" });
   const selectedCapability = useWatch({ control: form.control, name: "capability" });
   const bindingMode = useWatch({ control: form.control, name: "bindingMode" });
@@ -83,11 +85,15 @@ export function ModelsPage() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: (values: ModelForm) => {
+    mutationFn: async (values: ModelForm) => {
       if (!editing) throw new Error(t("errors.generic"));
       const input = { ...values, accountIds: values.bindingMode ? values.accountIds : [] };
       if (editing === "new") return createModel(input);
-      return updateModel(editing.id, { publicId: input.publicId, enabled: input.enabled, accountIds: input.accountIds });
+      const route = await updateModel(editing.id, { publicId: input.publicId, enabled: input.enabled, accountIds: input.accountIds });
+      if (input.qualityGuardState !== editing.qualityGuardState) {
+        await updateModelQualityGuard(editing.id, input.qualityGuardState);
+      }
+      return route;
     },
     onSuccess: () => {
       setSelected(new Set());
@@ -167,6 +173,7 @@ export function ModelsPage() {
       upstreamModel: model.upstreamModel,
       capability: model.capability,
       enabled: model.enabled,
+      qualityGuardState: model.qualityGuardState,
       bindingMode: model.bindingMode,
       accountIds: model.accountIds,
     });
@@ -175,7 +182,7 @@ export function ModelsPage() {
   function beginCreate(): void {
     setEditing("new");
     setAccountSearch("");
-    form.reset({ publicId: "", provider: "grok_build", upstreamModel: "", capability: "responses", enabled: true, bindingMode: false, accountIds: [] });
+    form.reset({ publicId: "", provider: "grok_build", upstreamModel: "", capability: "responses", enabled: true, qualityGuardState: "unknown", bindingMode: false, accountIds: [] });
   }
 
   function toggleBoundAccount(id: string, checked: boolean): void {
@@ -272,13 +279,14 @@ export function ModelsPage() {
         {modelsQuery.isError ? <ErrorState message={modelsQuery.error.message} onRetry={() => void modelsQuery.refetch()} /> : null}
         {!modelsQuery.isPending && !modelsQuery.isError && result?.items.length === 0 ? <EmptyState /> : null}
         {modelsQuery.isPending || (result && result.items.length > 0) ? (
-          <Table viewportRows={20} rowHeight={56} className="min-w-[1120px] table-fixed text-xs">
+          <Table viewportRows={20} rowHeight={56} className="min-w-[1210px] table-fixed text-xs">
             <colgroup>
               <col className="w-10" />
               <col className="w-56" />
               <col className="w-32" />
               <col className="w-52" />
               <col className="w-24" />
+              <col className="w-28" />
               <col className="w-32" />
               <col className="w-40" />
               <col className="w-44" />
@@ -291,6 +299,7 @@ export function ModelsPage() {
                 <SortableTableHead field="upstreamModel" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("models.upstream")}</SortableTableHead>
                 <TableHead className="text-center">{t("models.capability")}</TableHead>
                 <SortableTableHead field="status" sortBy={sort.field} sortOrder={sort.order} align="center" onSort={changeSort}>{t("models.status")}</SortableTableHead>
+                <TableHead className="text-center">{t("models.qualityGuard")}</TableHead>
                 <SortableTableHead field="provider" sortBy={sort.field} sortOrder={sort.order} align="center" onSort={changeSort}>{t("models.provider")}</SortableTableHead>
                 <SortableTableHead field="accountSupport" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" align="center" onSort={changeSort}>{t("models.accountSupport")}</SortableTableHead>
                 <SortableTableHead field="lastSyncedAt" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("models.lastSyncedAt")}</SortableTableHead>
@@ -298,9 +307,9 @@ export function ModelsPage() {
               </TableRow>
             </TableHeader>
             {modelsQuery.isPending ? (
-              <TableBody><TableLoadingRow colSpan={9} /></TableBody>
+              <TableBody><TableLoadingRow colSpan={10} /></TableBody>
             ) : (
-              <VirtualTableBody items={result?.items ?? []} colSpan={9} rowHeight={56} renderRow={(model) => {
+              <VirtualTableBody items={result?.items ?? []} colSpan={10} rowHeight={56} renderRow={(model) => {
                 const selectedRoutes = model.routes.filter((route) => selected.has(route.id)).length;
                 return (
                 <TableRow className="group h-14" key={model.key} data-state={selectedRoutes > 0 ? "selected" : undefined}>
@@ -313,6 +322,7 @@ export function ModelsPage() {
                   </TableCell>
                   <TableCell className="text-center"><ModelCapabilities capabilities={model.capabilities} /></TableCell>
                   <TableCell className="text-center">{model.enabledState === "enabled" ? <Badge variant="secondary" className="bg-emerald-500/10 text-emerald-700 dark:text-emerald-300">{t("common.enabled")}</Badge> : model.enabledState === "disabled" ? <Badge variant="outline" className="text-muted-foreground">{t("common.disabled")}</Badge> : <Badge variant="outline" className="text-amber-700 dark:text-amber-300">{t("models.partiallyEnabled")}</Badge>}</TableCell>
+                  <TableCell className="text-center"><QualityGuardBadge state={model.qualityGuardState} /></TableCell>
                   <TableCell className="text-center"><ModelProvider provider={model.provider} /></TableCell>
                   <TableCell className="text-center text-xs">
                     <div title={model.supportTitle}>
@@ -412,6 +422,26 @@ export function ModelsPage() {
                 </div>
                 <Switch id="model-enabled" checked={modelEnabled} onCheckedChange={(checked) => form.setValue("enabled", checked)} />
               </section>
+              {editing !== "new" ? (
+                <section className="flex items-center justify-between gap-4 rounded-lg bg-muted/25 px-3 py-2.5">
+                  <div className="min-w-0">
+                    <Label htmlFor="model-quality-guard">{t("models.qualityGuard")}</Label>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                      {selectedCapability === "responses" || selectedCapability === "chat" ? t("models.qualityGuardDescription") : t("models.qualityGuardMediaDescription")}
+                    </p>
+                  </div>
+                  {selectedCapability === "responses" || selectedCapability === "chat" ? (
+                    <Select value={qualityGuardState} onValueChange={(value) => form.setValue("qualityGuardState", value as QualityGuardModelState)}>
+                      <SelectTrigger id="model-quality-guard" className="w-28 shrink-0"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="enabled">{t("models.qualityGuardEnabled")}</SelectItem>
+                        <SelectItem value="disabled">{t("models.qualityGuardDisabled")}</SelectItem>
+                        <SelectItem value="unknown">{t("models.qualityGuardUnknown")}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  ) : <Badge variant="outline" className="shrink-0 text-muted-foreground">{t("models.qualityGuardDisabled")}</Badge>}
+                </section>
+              ) : null}
             </div>
             <DialogFooter className="shrink-0 gap-2 bg-muted/20 px-5 py-3.5 sm:gap-0"><Button type="button" variant="secondary" size="sm" onClick={() => setEditing(null)}>{t("common.cancel")}</Button><Button type="submit" size="sm" disabled={updateMutation.isPending}>{updateMutation.isPending ? <Spinner /> : null}{editing === "new" ? t("common.create") : t("common.save")}</Button></DialogFooter>
           </form>
@@ -473,6 +503,23 @@ function ModelCapabilities({ capabilities }: { capabilities: ModelDisplayCapabil
   );
 }
 
+function QualityGuardBadge({ state }: { state: QualityGuardModelState | "mixed" }) {
+  const { t } = useTranslation();
+  const label = state === "enabled"
+    ? t("models.qualityGuardEnabled")
+    : state === "disabled"
+      ? t("models.qualityGuardDisabled")
+      : state === "mixed"
+        ? t("models.qualityGuardMixed")
+        : t("models.qualityGuardUnknown");
+  const className = state === "enabled"
+    ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+    : state === "unknown" || state === "mixed"
+      ? "text-amber-700 dark:text-amber-300"
+      : "text-muted-foreground";
+  return <Badge variant={state === "enabled" ? "secondary" : "outline"} className={className}>{label}</Badge>;
+}
+
 type ModelDisplayCapability = ModelEndpointCapability;
 
 const endpointCapabilityMetadata = {
@@ -495,6 +542,7 @@ type ModelRouteGroup = {
   upstreamModel: string;
   capabilities: ModelDisplayCapability[];
   enabledState: "enabled" | "disabled" | "mixed";
+  qualityGuardState: QualityGuardModelState | "mixed";
   bindingState: "automatic" | "bound" | "mixed";
   supportedMax: number;
   supportedLabel: string;
@@ -507,6 +555,7 @@ function newModelRouteGroup(value: ModelRouteGroupDTO, t: TFunction): ModelRoute
   const routes = value.routes;
   const first = routes[0];
   const enabledCount = routes.filter((route) => route.enabled).length;
+  const qualityGuardStates = new Set(routes.map((route) => route.qualityGuardState));
   const boundCount = routes.filter((route) => route.bindingMode).length;
   const supportedValues = routes.map((route) => route.supportedAccounts);
   const totalValues = routes.map((route) => route.totalAccounts);
@@ -523,6 +572,7 @@ function newModelRouteGroup(value: ModelRouteGroupDTO, t: TFunction): ModelRoute
     upstreamModel: first.upstreamModel,
     capabilities: value.endpointCapabilities,
     enabledState: enabledCount === routes.length ? "enabled" : enabledCount === 0 ? "disabled" : "mixed",
+    qualityGuardState: qualityGuardStates.size === 1 ? routes[0].qualityGuardState : "mixed",
     bindingState: boundCount === routes.length ? "bound" : boundCount === 0 ? "automatic" : "mixed",
     supportedMax,
     supportedLabel: supportedMin === supportedMax ? String(supportedMax) : `${supportedMin}–${supportedMax}`,

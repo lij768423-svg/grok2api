@@ -53,20 +53,25 @@ type streamConverter struct {
 	thinkingIndex     int
 	thinkingItemID    string
 	chatReasoningMark bool
-	reasoningItems    map[string]*reasoningStreamState
-	reasoningOrder    []string
-	activeReasoningID string
-	nextIndex         int
-	tools             map[string]streamTool
-	webSearch         []webSearchCall
-	webSearchEmitted  map[string]bool
-	deferSearchText   bool
-	pendingSearchText strings.Builder
-	usage             responseUsage
-	options           ResponseOptions
-	stopFilter        *anthropicStreamStopFilter
-	stopSequence      string
-	refused           bool
+	// encryptedReasoningMark is an internal SSE comment consumed by the
+	// gateway quality scanner. It preserves proof that the Responses upstream
+	// returned encrypted reasoning when the downstream protocol has no field
+	// for that proof (notably Chat Completions).
+	encryptedReasoningMark bool
+	reasoningItems         map[string]*reasoningStreamState
+	reasoningOrder         []string
+	activeReasoningID      string
+	nextIndex              int
+	tools                  map[string]streamTool
+	webSearch              []webSearchCall
+	webSearchEmitted       map[string]bool
+	deferSearchText        bool
+	pendingSearchText      strings.Builder
+	usage                  responseUsage
+	options                ResponseOptions
+	stopFilter             *anthropicStreamStopFilter
+	stopSequence           string
+	refused                bool
 }
 
 type streamTool struct {
@@ -271,6 +276,11 @@ func (c *streamConverter) handle(event string, data []byte) error {
 	case "response.output_item.added":
 		var item responseItem
 		_ = json.Unmarshal(root["item"], &item)
+		if item.Type == "reasoning" && item.Encrypted != "" {
+			if err := c.markEncryptedReasoning(); err != nil {
+				return err
+			}
+		}
 		if item.Type == "reasoning" && c.reasoningOutputEnabled() {
 			c.ensureReasoningState(item.ID)
 		}
@@ -309,6 +319,11 @@ func (c *streamConverter) handle(event string, data []byte) error {
 			return c.toolArgumentsDone(item.ID, item.Arguments)
 		}
 		if item.Type == "reasoning" {
+			if item.Encrypted != "" {
+				if err := c.markEncryptedReasoning(); err != nil {
+					return err
+				}
+			}
 			if c.reasoningOutputEnabled() {
 				if err := c.reasoningDone(item); err != nil {
 					return err
@@ -324,6 +339,13 @@ func (c *streamConverter) handle(event string, data []byte) error {
 	case "response.completed", "response.incomplete":
 		var response responseEnvelope
 		_ = json.Unmarshal(root["response"], &response)
+		for _, item := range response.Output {
+			if item.Type == "reasoning" && item.Encrypted != "" {
+				if err := c.markEncryptedReasoning(); err != nil {
+					return err
+				}
+			}
+		}
 		c.setResponse(response)
 		if c.operation == OperationMessages && c.options.AnthropicWebSearch {
 			parsed := parseResponse(response)

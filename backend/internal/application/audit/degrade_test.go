@@ -13,6 +13,19 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 )
 
+func TestDegradeSevenDaySeriesUsesBoundedBuckets(t *testing.T) {
+	end := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	specs := degradeBucketSpecs(degradeWindow7d, end.Add(-7*24*time.Hour), end)
+	if len(specs) != 42 {
+		t.Fatalf("7d bucket count = %d, want 42", len(specs))
+	}
+	for index, spec := range specs {
+		if got := spec.Range.End.Sub(spec.Range.Start); got != 4*time.Hour && index != len(specs)-1 {
+			t.Fatalf("bucket %d duration = %s, want 4h", index, got)
+		}
+	}
+}
+
 func TestDegradeSummaryClassifiesStreamingAnomalies(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "degrade.db"))
@@ -248,8 +261,10 @@ func TestDegradeSummaryIncludesQualityDegradedThinkingRetries(t *testing.T) {
 	first := int64(100)
 	speedID := uint64(11)
 	thinkingID := uint64(22)
+	burstID := uint64(33)
 	records := []auditdomain.Record{
 		{RequestID: "speed-hard", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &speedID, AccountName: "fast", EgressNodeName: "edge-1", StatusCode: 200, Streaming: true, OutputTokens: 2000, FirstTokenMS: &first, DurationMS: 1100, CreatedAt: now.Add(-2 * time.Minute)},
+		{RequestID: "burst-retry", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &burstID, AccountName: "burst", EgressNodeName: "edge-3", StatusCode: 200, Streaming: true, ErrorCode: auditdomain.ErrorQualityBurstTPS, OutputTokens: 2000, FirstTokenMS: &first, DurationMS: 1100, CreatedAt: now.Add(-90 * time.Second)},
 		{RequestID: "think-retry-1", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &thinkingID, AccountName: "no-think", EgressNodeName: "edge-2", StatusCode: 200, Streaming: true, ErrorCode: auditdomain.ErrorQualityDegraded, OutputTokens: 48, CreatedAt: now.Add(-time.Minute)},
 		{RequestID: "think-retry-2", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &thinkingID, AccountName: "no-think", EgressNodeName: "edge-2", StatusCode: 200, Streaming: true, ErrorCode: auditdomain.ErrorQualityDegraded, OutputTokens: 0, CreatedAt: now.Add(-30 * time.Second)},
 		{RequestID: "think-final-503", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &thinkingID, AccountName: "no-think", StatusCode: 503, Streaming: true, ErrorCode: auditdomain.ErrorQualityDegraded, CreatedAt: now.Add(-20 * time.Second)},
@@ -263,10 +278,10 @@ func TestDegradeSummaryIncludesQualityDegradedThinkingRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Totals.Hits != 3 || summary.Totals.Accounts != 2 || summary.Totals.Hard != 1 || summary.Totals.Thinking != 2 {
+	if summary.Totals.Hits != 4 || summary.Totals.Accounts != 3 || summary.Totals.Hard != 2 || summary.Totals.Thinking != 2 {
 		t.Fatalf("totals = %#v", summary.Totals)
 	}
-	if len(summary.Accounts) != 2 {
+	if len(summary.Accounts) != 3 {
 		t.Fatalf("accounts = %#v", summary.Accounts)
 	}
 	byID := map[uint64]DegradeAccount{}
@@ -275,6 +290,9 @@ func TestDegradeSummaryIncludesQualityDegradedThinkingRetries(t *testing.T) {
 	}
 	if byID[22].Hits != 2 || byID[22].Classes[auditdomain.DegradeClassThinking] != 2 {
 		t.Fatalf("thinking account = %#v", byID[22])
+	}
+	if byID[33].Hits != 1 || byID[33].Classes[auditdomain.DegradeClassHard] != 1 {
+		t.Fatalf("burst account = %#v", byID[33])
 	}
 	thinkingOnly, err := service.DegradeSummary(ctx, "1h", DegradeThresholds{SoftTPS: 500, HardTPS: 1000}, DegradeAccountFilter{Class: auditdomain.DegradeClassThinking})
 	if err != nil {

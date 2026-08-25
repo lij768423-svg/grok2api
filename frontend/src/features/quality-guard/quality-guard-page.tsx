@@ -1,7 +1,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient, type UseMutationResult } from "@tanstack/react-query";
 import { Activity, AlertTriangle, BarChart3, Bot, Coins, Eye, Gauge, MoreHorizontal, Pencil, Plus, Power, PowerOff, RefreshCw, RotateCcw, RotateCw, Shield, ShieldCheck, ShieldX, TimerReset, Trash2, Zap } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -15,13 +15,16 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { listAllModelGroups, updateModelQualityGuard } from "@/entities/model/model-api";
+import type { ModelRouteDTO, QualityGuardModelState } from "@/entities/model/types";
 import { DegradeAccountsPanel } from "@/features/quality-guard/degrade-accounts-panel";
 import { ProbeProfilesPanel } from "@/features/quality-guard/probe-profiles-panel";
-import { getQualityGuardStatus, runQualityTest, updateQualityGuardPolicy, type QualityGuardEvent, type QualityGuardNodeState, type QualityGuardPolicy, type QualityGuardStatistics, type QualityGuardStatus, type QualityTestResult } from "@/features/quality-guard/quality-guard-api";
+import { getQualityGuardStatus, runQualityTest, updateConsoleQualityRetry, updateQualityGuardPolicy, type QualityGuardEvent, type QualityGuardNodeState, type QualityGuardPolicy, type QualityGuardStatistics, type QualityGuardStatus, type QualityTestResult } from "@/features/quality-guard/quality-guard-api";
 import { createEgressNode, deleteEgressNodes, listAllEgressNodes, updateEgressNode, updateEgressNodesEnabled, type EgressNodeDTO, type EgressNodeInput } from "@/features/settings/settings-api";
 import { ErrorState } from "@/shared/components/data-state";
 import { PageHeader } from "@/shared/components/page-header";
@@ -42,6 +45,28 @@ export function QualityGuardPage() {
     queryKey: ["quality-guard"],
     queryFn: getQualityGuardStatus,
     refetchInterval: 5_000,
+  });
+  const consoleRetryMutation = useMutation({
+    mutationFn: updateConsoleQualityRetry,
+    onSuccess: (requestRetry) => {
+      queryClient.setQueryData<QualityGuardStatus>(["quality-guard"], (current) => current ? { ...current, requestRetry } : current);
+      toast.success(t("qualityGuard.consoleRetrySaved"));
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("qualityGuard.consoleRetryFailed")),
+  });
+  const modelPoliciesQuery = useQuery({
+    queryKey: ["models", "quality-guard-policies"],
+    queryFn: () => listAllModelGroups(),
+    staleTime: 30_000,
+  });
+  const modelPolicies = useMemo(() => collectQualityGuardPolicies(modelPoliciesQuery.data?.items ?? []), [modelPoliciesQuery.data]);
+  const modelPolicyMutation = useMutation({
+    mutationFn: ({ routeId, state }: { routeId: string; state: QualityGuardModelState; key: string }) => updateModelQualityGuard(routeId, state),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["models"] });
+      toast.success(t("qualityGuard.modelPoliciesUpdated"));
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("qualityGuard.modelPoliciesUpdateFailed")),
   });
   const nodesQuery = useQuery({
     queryKey: ["quality-guard-egress-nodes"],
@@ -162,6 +187,21 @@ export function QualityGuardPage() {
         )}
       />
 
+      <ConsoleRetryCard
+        requestRetry={status?.requestRetry}
+        loading={statusQuery.isPending || consoleRetryMutation.isPending}
+        onChange={(enabled) => consoleRetryMutation.mutate(enabled)}
+      />
+
+      <ModelQualityGuardCard
+        policies={modelPolicies}
+        loading={modelPoliciesQuery.isPending}
+        error={modelPoliciesQuery.error instanceof Error ? modelPoliciesQuery.error.message : undefined}
+        updatingKey={modelPolicyMutation.isPending ? modelPolicyMutation.variables?.key : undefined}
+        onRetry={() => void modelPoliciesQuery.refetch()}
+        onChange={(policy, state) => modelPolicyMutation.mutate({ routeId: policy.routeId, state, key: policy.key })}
+      />
+
       <Tabs defaultValue="nodes">
         <TabsList>
           <TabsTrigger value="nodes">{t("qualityGuard.nodesTab")}</TabsTrigger>
@@ -249,6 +289,92 @@ export function QualityGuardPage() {
       </Tabs>
     </div>
   );
+}
+
+function ConsoleRetryCard({ requestRetry, loading, onChange }: { requestRetry?: QualityGuardStatus["requestRetry"]; loading: boolean; onChange: (enabled: boolean) => void }) {
+  const { t } = useTranslation();
+  const editable = requestRetry?.editable === true;
+  return <section className="flex flex-col gap-3 rounded-lg bg-card p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5" aria-labelledby="console-retry-title">
+    <div className="min-w-0">
+      <h2 id="console-retry-title" className="text-sm font-medium">{t("qualityGuard.consoleRetry")}</h2>
+      <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">{t("qualityGuard.consoleRetryHelp")}</p>
+      {requestRetry && !requestRetry.enabled ? <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">{t("qualityGuard.consoleRetryInactive")}</p> : null}
+    </div>
+    <Switch
+      checked={requestRetry?.consoleEnabled ?? false}
+      disabled={loading || !editable}
+      onCheckedChange={onChange}
+      aria-label={t("qualityGuard.consoleRetry")}
+    />
+  </section>;
+}
+
+type QualityGuardModelPolicy = {
+  key: string;
+  provider: ModelRouteDTO["provider"];
+  upstreamModel: string;
+  publicIds: string[];
+  routeId: string;
+  state: QualityGuardModelState;
+};
+
+const qualityGuardProviderOrder: ModelRouteDTO["provider"][] = ["grok_build", "grok_web", "grok_console"];
+
+function collectQualityGuardPolicies(groups: Array<{ routes: ModelRouteDTO[] }>): QualityGuardModelPolicy[] {
+  const policies = new Map<string, QualityGuardModelPolicy>();
+  for (const group of groups) {
+    for (const route of group.routes) {
+      if (route.capability !== "responses" && route.capability !== "chat") continue;
+      const key = `${route.provider}:${route.upstreamModel}`;
+      const current = policies.get(key);
+      if (!current) {
+        policies.set(key, {
+          key,
+          provider: route.provider,
+          upstreamModel: route.upstreamModel,
+          publicIds: [route.publicId],
+          routeId: route.id,
+          state: route.qualityGuardState,
+        });
+        continue;
+      }
+      if (!current.publicIds.includes(route.publicId)) current.publicIds.push(route.publicId);
+      if (current.state !== route.qualityGuardState) current.state = "unknown";
+    }
+  }
+  return Array.from(policies.values()).sort((left, right) => {
+    const providerDifference = qualityGuardProviderOrder.indexOf(left.provider) - qualityGuardProviderOrder.indexOf(right.provider);
+    return providerDifference || left.upstreamModel.localeCompare(right.upstreamModel) || left.key.localeCompare(right.key);
+  });
+}
+
+function ModelQualityGuardCard({ policies, loading, error, updatingKey, onRetry, onChange }: { policies: QualityGuardModelPolicy[]; loading: boolean; error?: string; updatingKey?: string; onRetry: () => void; onChange: (policy: QualityGuardModelPolicy, state: QualityGuardModelState) => void }) {
+  const { t } = useTranslation();
+  const sections = qualityGuardProviderOrder.map((provider) => ({ provider, policies: policies.filter((policy) => policy.provider === provider) })).filter((section) => section.policies.length > 0);
+  return <section className="overflow-hidden rounded-lg bg-card" aria-labelledby="model-quality-guard-title">
+    <div className="border-b px-4 py-4 sm:px-5">
+      <h2 id="model-quality-guard-title" className="text-sm font-medium">{t("qualityGuard.modelPolicies")}</h2>
+      <p className="mt-1 max-w-4xl text-xs leading-5 text-muted-foreground">{t("qualityGuard.modelPoliciesHelp")}</p>
+    </div>
+    {loading ? <div className="flex min-h-24 items-center justify-center"><Spinner className="size-5" /></div> : error ? <div className="flex flex-col items-center gap-3 px-4 py-8 text-center"><p className="text-sm text-muted-foreground">{error}</p><Button type="button" variant="secondary" size="sm" onClick={onRetry}>{t("common.retry")}</Button></div> : sections.length === 0 ? <div className="px-4 py-8 text-center text-sm text-muted-foreground">{t("qualityGuard.modelPoliciesEmpty")}</div> : <div className="divide-y">
+      {sections.map(({ provider, policies: providerPolicies }) => <div key={provider}>
+        <div className="flex items-center justify-between gap-3 bg-muted/25 px-4 py-2.5 sm:px-5"><h3 className="text-xs font-medium">{modelPolicyProviderLabel(provider, t)}</h3><span className="text-[11px] text-muted-foreground">{t("qualityGuard.modelPoliciesCount", { count: providerPolicies.length })}</span></div>
+        <div className="divide-y">
+          {providerPolicies.map((policy) => <div key={policy.key} className="grid gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_132px] sm:items-center sm:px-5">
+            <div className="min-w-0"><p className="break-words text-sm font-medium" title={policy.publicIds.join(", ")}>{policy.publicIds.join(", ")}</p><p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{policy.upstreamModel}</p></div>
+            <Select value={policy.state} disabled={updatingKey === policy.key} onValueChange={(value) => onChange(policy, value as QualityGuardModelState)}>
+              <SelectTrigger className="w-full" aria-label={t("qualityGuard.modelPoliciesSelect", { model: policy.upstreamModel })}><SelectValue /></SelectTrigger>
+              <SelectContent align="end"><SelectItem value="enabled">{t("models.qualityGuardEnabled")}</SelectItem><SelectItem value="disabled">{t("models.qualityGuardDisabled")}</SelectItem><SelectItem value="unknown">{t("models.qualityGuardUnknown")}</SelectItem></SelectContent>
+            </Select>
+          </div>)}
+        </div>
+      </div>)}
+    </div>}
+  </section>;
+}
+
+function modelPolicyProviderLabel(provider: ModelRouteDTO["provider"], t: (key: string) => string): string {
+  return provider === "grok_build" ? t("models.providerGrokBuild") : provider === "grok_web" ? t("models.providerGrokWeb") : t("qualityGuard.modelPoliciesProviderConsole");
 }
 
 function StatisticsPanel({ statistics, locale }: { statistics: QualityGuardStatistics; locale: string }) {

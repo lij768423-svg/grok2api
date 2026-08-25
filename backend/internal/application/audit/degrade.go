@@ -261,7 +261,10 @@ func degradeBucketSpecs(window string, start, end time.Time) []degradeBucketSpec
 	label := func(value time.Time) string { return value.Format("15:04") }
 	switch window {
 	case degradeWindow7d:
-		step = 2 * time.Hour
+		// Seven days at two-hour resolution produced 84 bars, which becomes
+		// unreadable once the account/node panels are used beside it. Four-hour
+		// buckets retain the trend while keeping the chart bounded at 42 bars.
+		step = 4 * time.Hour
 		label = func(value time.Time) string { return value.Format("01-02 15:00") }
 	case degradeWindow24h:
 		step = time.Hour

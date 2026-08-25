@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -100,6 +102,80 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	}
 	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Provider.Build.ResponseHeaderTimeout.Value() != 7*time.Minute || reloaded.Routing.MaxAttempts != 5 || !reloaded.Routing.PreferFreeBuild || !reloaded.Routing.SegmentedSelectorEnabled || reloaded.Routing.SegmentedMinCandidates != 5000 || reloaded.Routing.SegmentedWindowSize != 96 || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" || reloaded.Provider.Web.ClearanceMode != config.ClearanceModeOnDemand {
 		t.Fatalf("configuration was not persisted")
+	}
+}
+
+func TestUpdateConsoleQualityRetryPersistsAndHotApplies(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.QualityGuard.RequestRetry.Enabled = true
+	repository := &runtimeSettingsRepositoryStub{}
+	var applied config.Config
+	service := NewService(cfg, time.Time{}, 0, repository, nil, func(next config.Config) { applied = next })
+
+	state, err := service.UpdateConsoleQualityRetry(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.Enabled || !state.ConsoleEnabled || !applied.QualityGuard.RequestRetry.ConsoleEnabled {
+		t.Fatalf("quality retry state was not applied: state=%#v config=%#v", state, applied.QualityGuard.RequestRetry)
+	}
+	if repository.value.QualityRetry == nil || !repository.value.QualityRetry.ConsoleEnabled {
+		t.Fatalf("quality retry state was not persisted: %#v", repository.value.QualityRetry)
+	}
+	reloaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.QualityGuard.RequestRetry.ConsoleEnabled {
+		t.Fatal("persisted Console retry state was not reloaded")
+	}
+}
+
+func TestUpdateQualityRetryModelPolicyIsProviderScopedAndReversible(t *testing.T) {
+	cfg := testConfig(t)
+	repository := &runtimeSettingsRepositoryStub{}
+	var applied config.Config
+	service := NewService(cfg, time.Time{}, 0, repository, nil, func(next config.Config) { applied = next })
+
+	state, err := service.UpdateQualityRetryModelPolicy(context.Background(), accountdomain.ProviderConsole, "grok-4.5", "enabled")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := service.QualityRetryModelState(accountdomain.ProviderConsole, "grok-4.5"); got != modeldomain.QualityGuardModelEnabled {
+		t.Fatalf("console policy state = %q", got)
+	}
+	if got := service.QualityRetryModelState(accountdomain.ProviderBuild, "grok-4.5"); got != modeldomain.QualityGuardModelEnabled {
+		t.Fatalf("build default state = %q", got)
+	}
+	if len(state.ModelPolicies) != 1 || len(applied.QualityGuard.RequestRetry.ModelPolicies) != 1 {
+		t.Fatalf("policy was not persisted/applied: state=%#v applied=%#v", state, applied.QualityGuard.RequestRetry.ModelPolicies)
+	}
+	if _, err := service.UpdateQualityRetryModelPolicy(context.Background(), accountdomain.ProviderConsole, "grok-4.5", "unknown"); err != nil {
+		t.Fatal(err)
+	}
+	if got := service.QualityRetryModelState(accountdomain.ProviderConsole, "grok-4.5"); got != modeldomain.QualityGuardModelUnknown {
+		t.Fatalf("cleared console policy state = %q", got)
+	}
+	if _, err := service.UpdateQualityRetryModelPolicy(context.Background(), accountdomain.ProviderWeb, "grok-4.20-0309-non-reasoning", "enabled"); err != nil {
+		t.Fatal(err)
+	}
+	if got := service.QualityRetryModelState(accountdomain.ProviderWeb, "grok-4.20-0309-non-reasoning"); got != modeldomain.QualityGuardModelEnabled {
+		t.Fatalf("explicit web policy state = %q", got)
+	}
+}
+
+func TestLoadPersistedKeepsConsoleRetryFromYAMLWhenSettingIsMissing(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.QualityGuard.RequestRetry.ConsoleEnabled = true
+	value := toDomainConfig(cfg)
+	value.QualityRetry = nil
+	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.QualityGuard.RequestRetry.ConsoleEnabled {
+		t.Fatal("missing persisted Console retry setting overrode config.yaml")
 	}
 }
 

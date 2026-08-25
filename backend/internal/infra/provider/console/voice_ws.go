@@ -123,7 +123,7 @@ func (a *Adapter) DialVoiceWebSocket(ctx context.Context, request provider.Voice
 			}
 		}
 		dpopRequired := status == http.StatusForbidden && provider.IsDPoPProofRequiredBody(body)
-		if status == http.StatusForbidden && shouldInvalidateConsoleClearance(body) {
+		if status == http.StatusForbidden && shouldInvalidateConsoleClearance(http.Header(response.Header), body) {
 			lease.InvalidateClearance()
 		}
 		if !dpopRequired {

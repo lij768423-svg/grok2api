@@ -152,6 +152,12 @@ qualityGuard:
   # 误判成 missing-thinking（审计 200 · 错误）；30s 是校验上限，也是 lab 默认。
   requestRetry:
     enabled: true
+    # Console streams stay outside this path unless explicitly enabled from the
+    # Quality Guard page (or set to true here before first startup).
+    consoleEnabled: false
+    # Independent Build-only high-TPS guard. It uses hardTPS and
+    # minimumGenerationWindow above; Console is never included.
+    burstEnabled: false
     maxAttempts: 6
     holdTimeout: 30s
     minOutputTokens: 8

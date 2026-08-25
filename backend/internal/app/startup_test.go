@@ -28,6 +28,17 @@ func TestReadinessStartupReportDoesNotExposeInternalErrors(t *testing.T) {
 	}
 }
 
+func TestMergeWebQuotaCatchupIDsDeduplicatesWindowsAndPrioritizesDue(t *testing.T) {
+	ids := mergeWebQuotaCatchupIDs([]uint64{7, 7, 8}, []uint64{8, 9, 0}, 10)
+	if len(ids) != 3 || ids[0] != 7 || ids[1] != 8 || ids[2] != 9 {
+		t.Fatalf("merged catch-up IDs = %#v", ids)
+	}
+	limited := mergeWebQuotaCatchupIDs([]uint64{7, 8}, []uint64{9}, 2)
+	if len(limited) != 2 || limited[0] != 7 || limited[1] != 8 {
+		t.Fatalf("limited catch-up IDs = %#v", limited)
+	}
+}
+
 func TestReadinessKeepsBuildReadyWhenWebIsUnavailable(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "readiness.db"))

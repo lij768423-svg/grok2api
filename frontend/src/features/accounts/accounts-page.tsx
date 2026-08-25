@@ -91,7 +91,7 @@ import { AccountQuota, ConsoleQuota, WebQuota } from "@/features/accounts/accoun
 import { AccountNameCell } from "@/features/accounts/account-name-cell";
 import { WebAccountScriptsDialog } from "@/features/accounts/web-account-scripts";
 import { WebAccountSettingsDialogs, WebAccountSettingsMenu, type WebAccountConfirmationTarget } from "@/features/accounts/web-account-settings";
-import { assignEgressAccounts, listAllEgressNodes, listEgressNodes, listEgressSources, unassignEgressAccounts, type EgressScope } from "@/features/settings/settings-api";
+import { assignEgressAccounts, listEgressNodes, listEgressSources, unassignEgressAccounts, type EgressScope } from "@/features/settings/settings-api";
 
 function isAbortError(error: unknown): boolean {
   return (error instanceof DOMException || error instanceof Error) && error.name === "AbortError";
@@ -106,6 +106,7 @@ const emptyBuildDetectCounts = (): BuildDetectCounts => ({ ok: 0, invalid: 0, fa
 
 const egressFilterNodePageSize = 100;
 const egressFilterSourcePageSize = 100;
+const egressBindingNodePageSize = 100;
 
 type AccountSelection = {
   provider: AccountProvider;
@@ -150,6 +151,7 @@ export function AccountsPage() {
   const [egressConfigurationOpen, setEgressConfigurationOpen] = useState(false);
   const [egressConfigurationTask, setEgressConfigurationTask] = useState<EgressConfigurationTask>("bind");
   const [egressNodeID, setEgressNodeID] = useState("");
+  const [egressBindingSearch, setEgressBindingSearch] = useState("");
   const [cleanupOpen, setCleanupOpen] = useState(false);
   const [cleanupStatuses, setCleanupStatuses] = useState<Set<AccountCleanupStatus>>(() => new Set());
   // Cleanup preview + optional linked deletion (independent from the delete dialogs' state).
@@ -195,6 +197,7 @@ export function AccountsPage() {
   const [webConfirmationTarget, setWebConfirmationTarget] = useState<WebAccountConfirmationTarget | null>(null);
   const debouncedSearch = useDebouncedValue(search);
   const debouncedEgressFilterOptionsSearch = useDebouncedValue(egressFilterOptionsSearch);
+  const debouncedEgressBindingSearch = useDebouncedValue(egressBindingSearch);
 
   useEffect(() => () => {
     quotaSyncAbortRef.current?.abort();
@@ -249,11 +252,28 @@ export function AccountsPage() {
     queryKey: ["accounts", "summary"],
     queryFn: getAccountSummary,
   });
-  // The binding dialog still needs every compatible node, but only while open.
-  const egressNodesQuery = useQuery({
-    queryKey: ["egress-nodes", "account-binding"],
-    queryFn: () => listAllEgressNodes(),
+  // Binding choices are searched and paged on demand. Loading every Build
+  // node here made a 1,500-node pool block the account page and made Console
+  // bindings pull unrelated scopes into the same response.
+  const egressBindingPrimaryScope = accountProviderPrimaryEgressScope(provider);
+  const egressBindingPrimaryQuery = useInfiniteQuery({
+    queryKey: ["egress-nodes", "account-binding", egressBindingPrimaryScope, debouncedEgressBindingSearch],
+    queryFn: ({ pageParam }) => listEgressNodes({
+      page: pageParam, pageSize: egressBindingNodePageSize, search: debouncedEgressBindingSearch, scope: egressBindingPrimaryScope,
+    }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => lastPage.page * lastPage.pageSize < lastPage.total ? lastPage.page + 1 : undefined,
     enabled: egressConfigurationOpen && egressConfigurationTask === "bind",
+    staleTime: 60_000,
+  });
+  const egressBindingWebQuery = useInfiniteQuery({
+    queryKey: ["egress-nodes", "account-binding", "grok_web", debouncedEgressBindingSearch],
+    queryFn: ({ pageParam }) => listEgressNodes({
+      page: pageParam, pageSize: egressBindingNodePageSize, search: debouncedEgressBindingSearch, scope: "grok_web",
+    }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => lastPage.page * lastPage.pageSize < lastPage.total ? lastPage.page + 1 : undefined,
+    enabled: egressConfigurationOpen && egressConfigurationTask === "bind" && provider === "grok_console",
     staleTime: 60_000,
   });
   // Filter choices are loaded only when the third-level menu opens. Nodes and
@@ -1204,7 +1224,23 @@ export function AccountsPage() {
   }
   const providerAccountTotal = provider === "grok_build" ? buildSummary.total : provider === "grok_web" ? webSummary.total : consoleSummary.total;
   const hasProviderAccounts = providerAccountTotal > 0 || (result?.total ?? 0) > 0;
-  const bindableEgressNodes = (egressNodesQuery.data?.items ?? []).filter((node) => node.enabled && node.proxyConfigured && scopeSupportsAccountProvider(node.scope, provider));
+  const egressBindingPrimaryPages = egressBindingPrimaryQuery.data?.pages ?? [];
+  const egressBindingWebPages = provider === "grok_console" ? (egressBindingWebQuery.data?.pages ?? []) : [];
+  const bindableEgressNodes = [...egressBindingPrimaryPages, ...egressBindingWebPages]
+    .flatMap((page) => page.items)
+    .filter((node) => node.enabled && node.proxyConfigured && scopeSupportsAccountProvider(node.scope, provider));
+  const egressBindingLoading = egressBindingPrimaryQuery.isPending || egressBindingWebQuery.isPending;
+  const egressBindingError = egressBindingPrimaryQuery.isError || egressBindingWebQuery.isError;
+  const egressBindingFetching = egressBindingPrimaryQuery.isFetching || egressBindingWebQuery.isFetching;
+  const egressBindingHasMore = egressBindingPrimaryQuery.hasNextPage || (provider === "grok_console" && egressBindingWebQuery.hasNextPage);
+  const loadMoreEgressBindingNodes = () => {
+    if (egressBindingPrimaryQuery.isError) void egressBindingPrimaryQuery.refetch();
+    else if (egressBindingPrimaryQuery.hasNextPage) void egressBindingPrimaryQuery.fetchNextPage();
+    if (provider === "grok_console") {
+      if (egressBindingWebQuery.isError) void egressBindingWebQuery.refetch();
+      else if (egressBindingWebQuery.hasNextPage) void egressBindingWebQuery.fetchNextPage();
+    }
+  };
   const egressFilterSearchTerm = egressFilterOptionsSearch.trim().toLocaleLowerCase();
   const consoleWebNodePages = provider === "grok_console" ? (egressFilterConsoleWebNodesQuery.data?.pages ?? []) : [];
   const scopedEgressNodes = [...(egressFilterNodesQuery.data?.pages ?? []), ...consoleWebNodePages]
@@ -1427,9 +1463,10 @@ export function AccountsPage() {
                   setBatchMaxConcurrent("1");
                   setBatchConcurrencyOpen(true);
                 }}>{t("accounts.batchSetConcurrency")}</Button>
-                <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => {
-                  setEgressNodeID("");
-                  setEgressConfigurationTask("bind");
+				<Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => {
+				  setEgressNodeID("");
+				  setEgressBindingSearch("");
+				  setEgressConfigurationTask("bind");
                   setEgressConfigurationOpen(true);
                 }}>{t("accounts.egressConfiguration")}</Button>
                 {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConversion([...selected])}>{t("accountConversion.action")}</Button> : null}
@@ -2085,6 +2122,7 @@ export function AccountsPage() {
         if (!open) {
           setEgressConfigurationTask("bind");
           setEgressNodeID("");
+          setEgressBindingSearch("");
         }
       }}>
         <DialogContent className="sm:max-w-[460px]">
@@ -2101,9 +2139,13 @@ export function AccountsPage() {
             </Tabs>
             {egressConfigurationTask === "bind" ? (
               <div className="min-h-20">
-                {egressNodesQuery.isPending ? <div className="flex min-h-20 items-center justify-center"><Spinner /></div> : null}
-                {egressNodesQuery.isError ? <p className="text-sm text-destructive">{egressNodesQuery.error.message}</p> : null}
-                {!egressNodesQuery.isPending && !egressNodesQuery.isError ? (
+                <div className="relative mb-2">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input className="h-8 pl-8" value={egressBindingSearch} onChange={(event) => setEgressBindingSearch(event.target.value)} placeholder={t("accounts.egressBindingSearch")} />
+                </div>
+                {egressBindingLoading ? <div className="flex min-h-20 items-center justify-center"><Spinner /></div> : null}
+                {egressBindingError ? <p className="text-sm text-destructive">{t("accounts.egressBindingLoadFailed")}</p> : null}
+                {!egressBindingLoading && !egressBindingError ? (
                   bindableEgressNodes.length > 0 ? (
                     <div className="space-y-2">
                       <Label htmlFor="account-egress-node">{t("accounts.bindEgressNode")}</Label>
@@ -2117,6 +2159,9 @@ export function AccountsPage() {
                           ))}
                         </SelectContent>
                       </Select>
+                      {egressBindingHasMore ? <Button type="button" variant="ghost" size="sm" className="w-full" onClick={loadMoreEgressBindingNodes} disabled={egressBindingFetching}>
+                        {egressBindingFetching ? <Spinner /> : <MoreHorizontal />}{t("accounts.egressBindingLoadMore")}
+                      </Button> : null}
                     </div>
                   ) : <p className="text-xs leading-5 text-muted-foreground">{t("accounts.bindEgressNoNodes")}</p>
                 ) : null}
@@ -2128,7 +2173,7 @@ export function AccountsPage() {
             <Button
               type="button"
               size="sm"
-              disabled={bindEgressMutation.isPending || unbindEgressMutation.isPending || (egressConfigurationTask === "bind" && (!egressNodeID || egressNodesQuery.isPending || egressNodesQuery.isError))}
+              disabled={bindEgressMutation.isPending || unbindEgressMutation.isPending || (egressConfigurationTask === "bind" && (!egressNodeID || egressBindingLoading || egressBindingError))}
               onClick={() => {
                 if (egressConfigurationTask === "bind") bindEgressMutation.mutate();
                 else unbindEgressMutation.mutate();

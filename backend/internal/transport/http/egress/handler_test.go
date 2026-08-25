@@ -14,11 +14,39 @@ import (
 	"time"
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
+	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
+	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	"github.com/gin-gonic/gin"
 )
+
+type qualityRetrySettingsRepositoryStub struct {
+	value    settingsdomain.Config
+	revision uint64
+}
+
+func (r *qualityRetrySettingsRepositoryStub) Get(context.Context) (settingsdomain.Config, time.Time, uint64, bool, error) {
+	return r.value, time.Now().UTC(), r.revision, r.revision > 0, nil
+}
+
+func (r *qualityRetrySettingsRepositoryStub) Save(_ context.Context, value settingsdomain.Config, expectedRevision uint64) (time.Time, uint64, error) {
+	if expectedRevision != r.revision {
+		return time.Time{}, 0, repository.ErrConflict
+	}
+	r.value = value
+	r.revision++
+	return time.Now().UTC(), r.revision, nil
+}
+
+func qualityRetrySettingsService(consoleEnabled bool) *settingsapp.Service {
+	cfg := config.Config{QualityGuard: config.QualityGuardConfig{RequestRetry: config.QualityGuardRequestRetryConfig{
+		Enabled: true, ConsoleEnabled: consoleEnabled,
+	}}}
+	return settingsapp.NewService(cfg, time.Time{}, 0, &qualityRetrySettingsRepositoryStub{}, nil, nil)
+}
 
 type proxyRevealRepository struct {
 	node        egressdomain.Node
@@ -154,6 +182,44 @@ func TestQualityGuardStatusIsOptional(t *testing.T) {
 	NewHandler(nil).qualityGuardStatus(context)
 	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"available":false`) {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestQualityGuardStatusIncludesMainGatewayRetryState(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest("GET", "/egress-quality-guard", nil)
+	NewHandler(nil).WithSettings(qualityRetrySettingsService(false)).qualityGuardStatus(context)
+	body := recorder.Body.String()
+	if recorder.Code != 200 || !strings.Contains(body, `"requestRetry":{"consoleEnabled":false`) || !strings.Contains(body, `"editable":true`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, body)
+	}
+}
+
+func TestUpdateConsoleQualityRetryUsesMainGatewaySettings(t *testing.T) {
+	settings := qualityRetrySettingsService(false)
+	handler := NewHandler(nil).WithSettings(settings)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest("PUT", "/egress-quality-guard/request-retry", bytes.NewBufferString(`{"consoleEnabled":true}`))
+	context.Request.Header.Set("Content-Type", "application/json")
+	handler.updateConsoleQualityRetry(context)
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"consoleEnabled":true`) || !settings.QualityRetry().ConsoleEnabled {
+		t.Fatalf("status=%d body=%s state=%#v", recorder.Code, recorder.Body.String(), settings.QualityRetry())
+	}
+}
+
+func TestUpdateConsoleQualityRetryRejectsMissingOrUnknownFields(t *testing.T) {
+	handler := NewHandler(nil).WithSettings(qualityRetrySettingsService(false))
+	for _, body := range []string{`{}`, `{"consoleEnabled":true,"extra":1}`} {
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		context.Request = httptest.NewRequest("PUT", "/egress-quality-guard/request-retry", bytes.NewBufferString(body))
+		context.Request.Header.Set("Content-Type", "application/json")
+		handler.updateConsoleQualityRetry(context)
+		if recorder.Code != 400 || !strings.Contains(recorder.Body.String(), `"code":"invalidRequest"`) {
+			t.Fatalf("body=%s status=%d", body, recorder.Code)
+		}
 	}
 }
 

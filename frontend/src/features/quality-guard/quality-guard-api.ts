@@ -56,6 +56,12 @@ export type QualityGuardStatistics = {
   actions: { quarantined: number; restored: number; suppressed: number };
 };
 
+export type QualityRetryStatus = {
+  enabled: boolean;
+  consoleEnabled: boolean;
+  editable: boolean;
+};
+
 export type ProbeProfileSummary = {
   id: string;
   name: string;
@@ -79,6 +85,7 @@ export type ProbeProfile = {
 export type QualityGuardStatus = {
   available: boolean;
   editable?: boolean;
+  requestRetry?: QualityRetryStatus;
   startedAt?: number;
   updatedAt?: number;
   lastActiveCycleAt?: number;
@@ -139,6 +146,7 @@ const configValidator = hasShape({
   quarantine_seconds: isNumber, min_healthy_nodes: isNumber, max_output_tokens: isNumber,
   fail_closed: isBoolean, min_generation_ms: isNumber,
 });
+const qualityRetryValidator = hasShape({ enabled: isBoolean, consoleEnabled: isBoolean, editable: isBoolean });
 const detectionStatsValidator = hasShape({
   total: isNumber, healthy: isNumber, soft: isNumber, hard: isNumber,
   errors: isNumber, output_tokens: isNumber,
@@ -155,7 +163,7 @@ const decodeStatus = (value: unknown): QualityGuardStatus => {
     return value as QualityGuardStatus;
   }
   return createObjectDecoder<QualityGuardStatus>("quality guard", {
-    available: isBoolean, editable: isOptional(isBoolean), startedAt: isNumber, updatedAt: isNumber, lastActiveCycleAt: isNumber,
+    available: isBoolean, editable: isOptional(isBoolean), requestRetry: isOptional(qualityRetryValidator), startedAt: isNumber, updatedAt: isNumber, lastActiveCycleAt: isNumber,
     lastPassivePollAt: isNumber, activeProfileId: isOptional(isString),
     profiles: isOptional(isArrayOf(hasShape({
       id: isString, name: isString, built_in: isBoolean, match_mode: isString, has_expected: isBoolean,
@@ -176,6 +184,16 @@ const decodeQualityTest = createObjectDecoder<QualityTestResult>("quality test",
 
 export function getQualityGuardStatus(): Promise<QualityGuardStatus> {
   return apiRequest("/api/admin/v1/egress-quality-guard", {}, decodeStatus);
+}
+
+const decodeQualityRetryStatus = createObjectDecoder<QualityRetryStatus>("quality retry", {
+  enabled: isBoolean, consoleEnabled: isBoolean, editable: isBoolean,
+});
+
+export function updateConsoleQualityRetry(consoleEnabled: boolean): Promise<QualityRetryStatus> {
+  return apiRequest("/api/admin/v1/egress-quality-guard/request-retry", {
+    method: "PUT", body: { consoleEnabled },
+  }, decodeQualityRetryStatus);
 }
 
 export function runQualityTest(nodeId: string, status: QualityGuardStatus, profileId?: string): Promise<QualityTestResult> {

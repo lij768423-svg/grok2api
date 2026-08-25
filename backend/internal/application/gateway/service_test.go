@@ -3290,6 +3290,89 @@ func TestGatewayGeneric429CoolsAccountAndRotates(t *testing.T) {
 	}
 }
 
+func TestGatewayBuildStreamingEmptyBeforeFirstByteRotatesAccount(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "build-empty-stream.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	first, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "empty-first", SourceKey: "empty-first", EncryptedAccessToken: "one",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "empty-second", SourceKey: "empty-second", EncryptedAccessToken: "two",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{"grok-4.6"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range []account.Credential{first, second} {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.6"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "empty-stream-key", Prefix: "empty-stream", SecretHash: strings.Repeat("8", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
+		first.ID:  {{status: http.StatusOK, body: ""}},
+		second.ID: {{status: http.StatusOK, body: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"}},
+	}}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-build-empty-stream", ClientKey: clientKey, PublicModel: "grok-4.6",
+		Streaming: true, Body: []byte(`{"model":"grok-4.6","input":"hello","stream":true}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Finalize(Usage{}, "", "")
+	_ = result.Body.Close()
+	if !strings.Contains(string(body), "response.output_text.delta") {
+		t.Fatalf("body = %q, want second account stream", body)
+	}
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != first.ID || attempts[1] != second.ID {
+		t.Fatalf("empty first stream must rotate once, attempts=%#v", attempts)
+	}
+	cooled, err := accountRepo.Get(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cooled.CooldownUntil == nil || cooled.FailureCount != 1 {
+		t.Fatalf("empty-stream account was not cooled: %#v", cooled)
+	}
+}
+
 func TestGatewayExhausted429PreservesLastBodyInFailure(t *testing.T) {
 	// When all attempts fail, CreateResponse returns UpstreamFailure (sanitized).
 	// captureResponse must reattach the diagnostic body so subsequent classification

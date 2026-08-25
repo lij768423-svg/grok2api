@@ -60,6 +60,30 @@ func TestSupportedReasoningEffortsPerModel(t *testing.T) {
 	}
 }
 
+func TestDefaultQualityGuardModelStateIsProviderScoped(t *testing.T) {
+	tests := []struct {
+		provider account.Provider
+		model    string
+		want     QualityGuardModelState
+	}{
+		{account.ProviderBuild, "grok-4.5", QualityGuardModelEnabled},
+		{account.ProviderBuild, "grok-4.6-high", QualityGuardModelEnabled},
+		{account.ProviderConsole, "grok-4.5", QualityGuardModelUnknown},
+		{account.ProviderConsole, "grok-4.20-multi-agent-0309", QualityGuardModelUnknown},
+		{account.ProviderWeb, "grok-4.6", QualityGuardModelUnknown},
+		{account.ProviderConsole, "grok-4.20-0309-non-reasoning", QualityGuardModelDisabled},
+		{account.ProviderBuild, GrokComposer25Fast, QualityGuardModelDisabled},
+	}
+	for _, test := range tests {
+		if got := DefaultQualityGuardModelState(test.provider, test.model); got != test.want {
+			t.Fatalf("DefaultQualityGuardModelState(%q, %q) = %q, want %q", test.provider, test.model, got, test.want)
+		}
+	}
+	if QualityGuardModelKey(account.ProviderBuild, "Build/grok-4.5") == QualityGuardModelKey(account.ProviderConsole, "Console/grok-4.5") {
+		t.Fatal("provider must be part of the quality guard key")
+	}
+}
+
 func TestIsGrokComposerModel(t *testing.T) {
 	for _, value := range []string{GrokComposer25Fast, "Build/" + GrokComposer25Fast, "GROK-COMPOSER-FUTURE"} {
 		if !IsGrokComposerModel(value) {

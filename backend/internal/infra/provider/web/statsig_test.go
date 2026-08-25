@@ -108,6 +108,44 @@ func TestFetchStatsigMetaContentRejectsNon404IndexStatuses(t *testing.T) {
 	}
 }
 
+func TestFetchStatsigMetaContentOnlyInvalidatesClearanceForCloudflareChallenge(t *testing.T) {
+	tests := []struct {
+		name        string
+		header      http.Header
+		body        string
+		invalidated int
+	}{
+		{name: "ordinary forbidden", body: `{"error":"forbidden"}`, invalidated: 0},
+		{name: "cloudflare challenge", header: http.Header{"Cf-Mitigated": []string{"challenge"}}, body: `{"error":"forbidden"}`, invalidated: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			invalidations := 0
+			do := func(request *http.Request) (*http.Response, error) {
+				if request.URL.Path != "/index" {
+					t.Fatalf("unexpected fallback to %q", request.URL.Path)
+				}
+				return &http.Response{
+					StatusCode: http.StatusForbidden,
+					Header:     test.header,
+					Body:       io.NopCloser(strings.NewReader(test.body)),
+				}, nil
+			}
+			_, err := fetchStatsigMetaContentWithDoAndInvalidate(
+				context.Background(), "https://grok.com", "sso-token",
+				&infraegress.Lease{UserAgent: "test-agent"}, do,
+				func() { invalidations++ },
+			)
+			if err == nil || !strings.Contains(err.Error(), "Grok index 返回 403") {
+				t.Fatalf("err=%v", err)
+			}
+			if invalidations != test.invalidated {
+				t.Fatalf("invalidations=%d, want %d", invalidations, test.invalidated)
+			}
+		})
+	}
+}
+
 func TestFetchStatsigMetaContentRequiresSuccessfulRoot(t *testing.T) {
 	for _, withMeta := range []bool{false, true} {
 		t.Run(fmt.Sprintf("meta_%t", withMeta), func(t *testing.T) {

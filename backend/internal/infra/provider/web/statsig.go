@@ -17,6 +17,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/pkg/signerurl"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/singleflight"
@@ -275,14 +276,21 @@ func fetchStatsigMetaContent(ctx context.Context, baseURL, token string, lease *
 	if lease == nil {
 		return "", fmt.Errorf("Statsig 获取缺少出口租约")
 	}
-	return fetchStatsigMetaContentWithDo(ctx, baseURL, token, lease, lease.Do)
+	// A product/API 403 is not evidence that the browser Clearance is stale.
+	// Leave invalidation to the response classifier below so background Statsig
+	// refreshes cannot start a solver cycle for an ordinary upstream rejection.
+	return fetchStatsigMetaContentWithDoAndInvalidate(ctx, baseURL, token, lease, lease.DoDeferredForbidden, lease.InvalidateClearance)
 }
 
 func fetchStatsigMetaContentWithDo(ctx context.Context, baseURL, token string, lease *infraegress.Lease, do func(*http.Request) (*http.Response, error)) (string, error) {
+	return fetchStatsigMetaContentWithDoAndInvalidate(ctx, baseURL, token, lease, do, nil)
+}
+
+func fetchStatsigMetaContentWithDoAndInvalidate(ctx context.Context, baseURL, token string, lease *infraegress.Lease, do func(*http.Request) (*http.Response, error), invalidate func()) (string, error) {
 	if do == nil {
 		return "", fmt.Errorf("Statsig 获取缺少出口租约")
 	}
-	index, err := fetchStatsigMetaResponse(ctx, baseURL, token, lease, "/index", do)
+	index, err := fetchStatsigMetaResponse(ctx, baseURL, token, lease, "/index", do, invalidate)
 	if err != nil {
 		return "", err
 	}
@@ -302,7 +310,7 @@ func fetchStatsigMetaContentWithDo(ctx context.Context, baseURL, token string, l
 
 	// /index currently returns a branded 404. Only that exact status with a
 	// missing meta is allowed to fall back to the canonical root page.
-	root, err := fetchStatsigMetaResponse(ctx, baseURL, token, lease, "/", do)
+	root, err := fetchStatsigMetaResponse(ctx, baseURL, token, lease, "/", do, invalidate)
 	if err != nil {
 		return "", err
 	}
@@ -317,7 +325,7 @@ type statsigMetaResponse struct {
 	body       []byte
 }
 
-func fetchStatsigMetaResponse(ctx context.Context, baseURL, token string, lease *infraegress.Lease, path string, do func(*http.Request) (*http.Response, error)) (statsigMetaResponse, error) {
+func fetchStatsigMetaResponse(ctx context.Context, baseURL, token string, lease *infraegress.Lease, path string, do func(*http.Request) (*http.Response, error), invalidate func()) (statsigMetaResponse, error) {
 	requestCtx, cancel := context.WithTimeout(infraegress.WithPhysicalCallStage(ctx, "statsig_meta"), 15*time.Second)
 	defer cancel()
 	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, strings.TrimRight(baseURL, "/")+path, nil)
@@ -348,6 +356,9 @@ func fetchStatsigMetaResponse(ctx context.Context, baseURL, token string, lease 
 	}
 	if len(body) > statsigMetaBodyLimit {
 		return statsigMetaResponse{}, statsigMetaOversizeError(path)
+	}
+	if response.StatusCode == http.StatusForbidden && provider.IsCloudflareChallengeResponse(response.Header, body) && invalidate != nil {
+		invalidate()
 	}
 	return statsigMetaResponse{statusCode: response.StatusCode, body: body}, nil
 }
@@ -458,6 +469,7 @@ func (a *Adapter) WarmStatsig(ctx context.Context, credential account.Credential
 	if a.statsig == nil {
 		return 0, fmt.Errorf("Statsig 签名器未初始化")
 	}
+	ctx = infraegress.WithClearanceSolveSuppressed(ctx)
 	token, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
 	if err != nil {
 		return 0, err

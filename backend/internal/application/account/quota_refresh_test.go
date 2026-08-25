@@ -168,6 +168,21 @@ func TestQuotaRefreshFailureUsesBoundedExponentialBackoff(t *testing.T) {
 	}
 }
 
+func TestWebQuotaCooldownSkipsAlreadyQueuedBackgroundProbe(t *testing.T) {
+	service := NewService(nil, nil, nil, nil, nil, nil, nil)
+	now := time.Date(2026, 8, 24, 8, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	service.recordWebQuotaForbidden(context.Background(), 77)
+
+	_, err := service.ProbeQuotaMode(context.Background(), 77, "fast")
+	if !errors.Is(err, provider.ErrQuotaForbidden) {
+		t.Fatalf("probe error = %v, want ErrQuotaForbidden", err)
+	}
+	if retryAfter := provider.ErrorRetryAfter(err); retryAfter < webQuotaForbiddenCooldown {
+		t.Fatalf("probe retry-after = %s, want at least %s", retryAfter, webQuotaForbiddenCooldown)
+	}
+}
+
 func TestRecentConsoleUsageSnapshotSuppressesDuplicateUpstreamRefresh(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "console-refresh-throttle.db"))
@@ -881,6 +896,47 @@ func TestRefreshQuotaUnauthorizedMarksWebAccountInvalid(t *testing.T) {
 	}
 }
 
+func TestQuotaRefreshForbiddenUsesBackgroundCooldownBackoff(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quota-forbidden-cooldown.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "web-forbidden", SourceKey: "web-forbidden", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
+	service := NewService(accounts, nil, nil, nil, provider.NewRegistry(&quotaCountingAdapter{modeErr: provider.ErrQuotaForbidden}), nil, nil)
+	service.now = func() time.Time { return now }
+	service.QueueQuotaRefresh(credential.ID, "fast")
+	request := <-service.quotaRefreshQueue
+	service.runQuotaRefresh(ctx, request)
+
+	service.quotaRefreshMu.Lock()
+	state := service.quotaRefreshes[request.key]
+	service.quotaRefreshMu.Unlock()
+	if state == nil || !state.pending || state.nextAttemptAt.Before(now.Add(webQuotaForbiddenCooldown)) {
+		t.Fatalf("forbidden refresh state = %#v, want cooldown >= %s", state, now.Add(webQuotaForbiddenCooldown))
+	}
+	stored, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WebQuotaRetryAfter == nil || stored.WebQuotaRetryAfter.Before(now.Add(webQuotaForbiddenCooldown)) {
+		t.Fatalf("stored quota cooldown = %#v", stored.WebQuotaRetryAfter)
+	}
+}
+
 type deniedQuotaRefreshLock struct{}
 
 func (deniedQuotaRefreshLock) Acquire(context.Context, string, time.Duration) (func(), bool, error) {
@@ -892,6 +948,7 @@ type quotaCountingAdapter struct {
 	fullCalls     atomic.Int64
 	identityCalls atomic.Int64
 	fullErr       error
+	modeErr       error
 	modeStarted   chan struct{}
 	modeRelease   chan struct{}
 }
@@ -986,6 +1043,9 @@ func (a *quotaCountingAdapter) SyncAccountIdentity(context.Context, accountdomai
 
 func (a *quotaCountingAdapter) SyncQuotaMode(_ context.Context, credential accountdomain.Credential, mode string) (accountdomain.QuotaWindow, error) {
 	a.modeCalls.Add(1)
+	if a.modeErr != nil {
+		return accountdomain.QuotaWindow{}, a.modeErr
+	}
 	if a.modeStarted != nil {
 		a.modeStarted <- struct{}{}
 	}

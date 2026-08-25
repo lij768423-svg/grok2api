@@ -1020,6 +1020,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	authRecoveryAttempted := make(map[uint64]bool)
 	holdCfg := s.qualityRetryConfig()
 	qualityHoldEnabled := shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
+	emptyBuildStreamRecovery := shouldRecoverEmptyBuildStream(input, ownership, route)
 	// Count accounts that actually reached the upstream. Credential-only skips
 	// do not consume the quality retry budget; refreshes stay on the same account.
 	qualityAccountAttempts := 0
@@ -1175,6 +1176,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		lease             *accountLease
 		credential        accountdomain.Credential
 		usage             Usage
+		decision          QualityHoldDecision
 		upstreamStartedAt time.Time
 	}
 	var fallback *qualityFallback
@@ -1183,7 +1185,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			return
 		}
 		if recordDegraded {
-			s.recordQualityDegraded(ctx, auditBase, fallback.credential, fallback.usage, startedAt, egressTrace, route.Provider)
+			s.recordQualityDegradedDecision(ctx, auditBase, fallback.credential, fallback.usage, startedAt, egressTrace, route.Provider, fallback.decision)
 			failureAttempts.captureQualityDegraded(fallback.credential, fallback.upstreamStartedAt)
 		}
 		_ = fallback.response.Body.Close()
@@ -1514,9 +1516,57 @@ attemptLoop:
 			continue
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			// A Build response can send successful HTTP headers and then remain
+			// completely silent until the stream-idle deadline. Do not commit those
+			// headers to the client: with no bytes exposed, one account replacement
+			// is safe and avoids turning an otherwise recoverable attempt into a
+			// downstream Responses server_error. Quality-held streams already perform
+			// the same empty-stream recovery below, so avoid nesting two read pumps.
+			if emptyBuildStreamRecovery && !qualityHoldEnabled {
+				replay, received, peekErr := peekInitialStream(ctx, response.Body)
+				if peekErr != nil || !received {
+					if peekErr == nil {
+						peekErr = errUpstreamStreamEmpty
+					}
+					failureAttempts.captureStreamTransportFailure(credential, responseStartedAt, response, peekErr)
+					if replay != nil {
+						_ = replay.Close()
+					} else {
+						_ = response.Body.Close()
+					}
+					lease.completeSelectorObservation(false)
+					lease.Release()
+					lastErr = peekErr
+					if isClientRequestCancel(ctx, peekErr) {
+						lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), peekErr)}
+						break
+					}
+					lastFailure = newTransportUpstreamFailure(peekErr, credential.ID, credential.Name)
+					idleOrEmpty := neterrorpkg.IsUpstreamStreamIdleTimeout(peekErr) || errors.Is(peekErr, errUpstreamStreamEmpty)
+					writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+					cooldown := time.Duration(0)
+					status := 0
+					if idleOrEmpty {
+						status = http.StatusGatewayTimeout
+						cooldown = holdCfg.IdleAccountCooldown
+					}
+					if markErr := s.selector.MarkFailureAfterSuccess(writeCtx, credential, status, cooldown); markErr != nil {
+						s.logger.Warn("build_initial_stream_failure_cooldown_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", markErr)
+					} else {
+						s.logger.Warn("build_initial_stream_retry", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "error", lastFailure.Code, "cooldown", cooldown)
+					}
+					writeCancel()
+					if shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
+						break
+					}
+					continue
+				}
+				response.Body = replay
+			}
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			if qualityHoldEnabled {
-				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
+				replay, decision, peekUsage, _, peekErr := peekQualityStreamDecisionStarted(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg, responseStartedAt)
+				verdict := decision.Verdict
 				if peekErr != nil {
 					if replay != nil {
 						_ = replay.Close()
@@ -1553,42 +1603,56 @@ attemptLoop:
 				hasNextAccount = hasNextAccount && qualityAccountAttempts < holdCfg.MaxAttempts
 				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
 				if verdict == QualityWithhold {
-					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown)
+					if decision.Reason == QualityDegradeHardTPS {
+						s.applyBurstTPSPenalty(ctx, input.RequestID, credential, holdCfg.BurstAccountCooldown, decision.OutputTPS, decision.GenerationMS)
+					} else {
+						s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown)
+					}
 				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
-					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider)
+					s.recordQualityDegradedDecision(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider, decision)
 					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
 				}
 				switch commit.Action {
 				case QualityActionRetry:
 					if deferFailOpenAudit {
 						discardFallback(true)
-						fallback = &qualityFallback{response: response, lease: lease, credential: credential, usage: peekUsage, upstreamStartedAt: responseStartedAt}
+						fallback = &qualityFallback{response: response, lease: lease, credential: credential, usage: peekUsage, decision: decision, upstreamStartedAt: responseStartedAt}
 						lease.completeSelectorObservation(true)
 						lease.Release()
 					} else {
 						_ = response.Body.Close()
 						lease.Release()
 					}
-					lastErr = errQualityDegraded
+					degradeErr := qualityDegradeError(decision.Reason)
+					lastErr = degradeErr
 					lastFailure = &UpstreamFailure{
 						HTTPStatus: http.StatusServiceUnavailable, Code: ErrorQualityDegraded,
-						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
-						Cause: errQualityDegraded,
+						PublicMessage: qualityDegradePublicMessage(decision.Reason), AccountID: credential.ID, AccountName: credential.Name,
+						Cause: degradeErr,
 					}
-					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+					logEvent := "quality_degraded_retry"
+					if decision.Reason == QualityDegradeHardTPS {
+						logEvent = "quality_burst_tps_retry"
+					}
+					s.logger.Info(logEvent, "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "output_tps", decision.OutputTPS, "generation_ms", decision.GenerationMS)
 					continue
 				case QualityActionReject:
 					_ = response.Body.Close()
 					lease.Release()
-					lastErr = errQualityDegraded
+					degradeErr := qualityDegradeError(decision.Reason)
+					lastErr = degradeErr
 					lastFailure = &UpstreamFailure{
 						HTTPStatus: http.StatusServiceUnavailable, Code: ErrorQualityDegraded,
-						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
-						Cause: errQualityDegraded,
+						PublicMessage: qualityDegradePublicMessage(decision.Reason), AccountID: credential.ID, AccountName: credential.Name,
+						Cause: degradeErr,
 					}
-					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID)
+					logEvent := "quality_degraded_rejected"
+					if decision.Reason == QualityDegradeHardTPS {
+						logEvent = "quality_burst_tps_rejected"
+					}
+					s.logger.Info(logEvent, "request_id", input.RequestID, "account_id", credential.ID, "output_tokens", peekUsage.OutputTokens, "output_tps", decision.OutputTPS, "generation_ms", decision.GenerationMS)
 					break attemptLoop
 				case QualityActionDeliverLast:
 					discardFallback(true)

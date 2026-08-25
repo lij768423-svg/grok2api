@@ -957,7 +957,7 @@ func TestAdapterDoesNotPenalizeEgressForBlockedAccount(t *testing.T) {
 		wantUpdates int
 	}{
 		{name: "blocked account", body: `{"code":"unauthorized:blocked-user","error":"User is blocked"}`, wantUpdates: 0},
-		{name: "anti-bot rejection", body: `{"error":{"code":7,"message":"Request rejected by anti-bot rules."}}`, wantUpdates: 1},
+		{name: "anti-bot application rejection", body: `{"error":{"code":7,"message":"Request rejected by anti-bot rules."}}`, wantUpdates: 0},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1009,19 +1009,22 @@ func TestAdapterDoesNotPenalizeEgressForBlockedAccount(t *testing.T) {
 func TestShouldInvalidateConsoleClearance(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name string
-		body string
-		want bool
+		name   string
+		header http.Header
+		body   string
+		want   bool
 	}{
 		{name: "dpop protocol rejection", body: `{"code":"unauthorized:dpop-required","error":"DPoP proof required"}`, want: false},
 		{name: "blocked account", body: `{"code":"unauthorized:blocked-user","error":"User is blocked"}`, want: false},
-		{name: "anti-bot rejection", body: `{"error":{"code":7,"message":"Request rejected by anti-bot rules."}}`, want: true},
-		{name: "generic forbidden", body: `forbidden`, want: true},
+		{name: "explicit challenge header", header: http.Header{"Cf-Mitigated": []string{"challenge"}}, body: `{"error":"forbidden"}`, want: true},
+		{name: "challenge document", body: `<!doctype html><title>Just a moment...</title><script src="/cdn-cgi/challenge-platform/script"></script>`, want: true},
+		{name: "anti-bot application rejection", body: `{"error":{"code":7,"message":"Request rejected by anti-bot rules."}}`, want: false},
+		{name: "generic forbidden", body: `forbidden`, want: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if got := shouldInvalidateConsoleClearance([]byte(test.body)); got != test.want {
+			if got := shouldInvalidateConsoleClearance(test.header, []byte(test.body)); got != test.want {
 				t.Fatalf("shouldInvalidateConsoleClearance() = %v, want %v", got, test.want)
 			}
 		})

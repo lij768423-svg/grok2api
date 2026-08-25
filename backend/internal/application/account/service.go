@@ -18,6 +18,7 @@ import (
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
@@ -46,6 +47,51 @@ var (
 var ErrCredentialRefreshPermanent = errors.New("OAuth refresh token 已永久失效")
 var errQuotaRefreshBusy = errors.New("额度同步已由其他实例执行")
 
+type webQuotaCooldownRepository interface {
+	MarkWebQuotaSyncCooldown(context.Context, uint64, time.Time) error
+	ClearWebQuotaSyncCooldown(context.Context, uint64) error
+}
+
+// webQuotaForbiddenRetryError keeps the ordinary Web quota 403 visible to
+// callers while carrying the background-only cooldown. The retry hint is
+// consumed by both the quota refresh worker and the quota recovery worker, so
+// an already queued event cannot fall back to their short generic backoff.
+type webQuotaForbiddenRetryError struct {
+	cause      error
+	retryAfter time.Duration
+}
+
+func (e *webQuotaForbiddenRetryError) Error() string {
+	if e == nil || e.cause == nil {
+		return "Web quota probe is cooling down"
+	}
+	return e.cause.Error()
+}
+
+func (e *webQuotaForbiddenRetryError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *webQuotaForbiddenRetryError) RetryAfterDuration() time.Duration {
+	if e == nil {
+		return 0
+	}
+	return max(0, e.retryAfter)
+}
+
+func wrapWebQuotaForbidden(err error) error {
+	if err == nil || !errors.Is(err, provider.ErrQuotaForbidden) {
+		return err
+	}
+	if provider.ErrorRetryAfter(err) > 0 {
+		return err
+	}
+	return &webQuotaForbiddenRetryError{cause: err, retryAfter: webQuotaForbiddenCooldown}
+}
+
 const (
 	// estimatedFreeTokenLimit is only a fallback until an upstream exhaustion
 	// response supplies the account-specific actual/limit pair.
@@ -63,6 +109,12 @@ const (
 	credentialUnclassifiedAuthLimit               = 5
 	managedTaskWorkerCeiling                      = 50
 	quotaRefreshQueueSize                         = 4096
+	webQuotaCatchupWorkers                        = 4
+	// Keep background Web quota probes visibly below interactive traffic. The
+	// account batch still has a small worker pool, but only one account may enter
+	// the upstream probe turn per second.
+	webQuotaCatchupInterval         time.Duration = time.Second
+	webQuotaForbiddenCooldown       time.Duration = 6 * time.Hour
 	quotaRefreshTimeout                           = 30 * time.Second
 	quotaRefreshDirtyTTL                          = 24 * time.Hour
 	quotaRefreshPollInterval                      = 500 * time.Millisecond
@@ -395,32 +447,36 @@ func (s *Service) Summary(ctx context.Context) (Summary, error) {
 
 // Service 负责 OAuth 账号接入、刷新、额度和持久化生命周期。
 type Service struct {
-	accounts            repository.AccountRepository
-	audits              repository.AuditRepository
-	deviceSessions      repository.DeviceSessionRepository
-	sticky              repository.StickySessionRepository
-	refreshLock         repository.DistributedLock
-	concurrency         repository.ConcurrencyLimiter
-	quotaQueue          repository.QuotaRecoveryQueue
-	quotaRefreshState   repository.QuotaRefreshCoordinator
-	providers           *provider.Registry
-	cipher              *security.Cipher
-	refreshes           singleflight.Group
-	billingSyncs        singleflight.Group
-	quotaSyncs          singleflight.Group
-	identitySyncs       singleflight.Group
-	observedModelWrites singleflight.Group
-	observedModelStore  repository.ObservedModelStateRepository
-	refreshMu           sync.Mutex
-	lastRefreshAt       map[uint64]time.Time
-	observedModelShards [observedModelLockShards]observedModelShard
-	quotaRefreshMu      sync.Mutex
-	quotaRefreshes      map[string]*quotaRefreshState
-	quotaRefreshQueue   chan quotaRefreshRequest
-	quotaRefreshWake    chan struct{}
-	conversionPool      *batch.Pool
-	syncPool            *batch.Pool
-	refreshPool         *batch.Pool
+	accounts                 repository.AccountRepository
+	audits                   repository.AuditRepository
+	deviceSessions           repository.DeviceSessionRepository
+	sticky                   repository.StickySessionRepository
+	refreshLock              repository.DistributedLock
+	concurrency              repository.ConcurrencyLimiter
+	quotaQueue               repository.QuotaRecoveryQueue
+	quotaRefreshState        repository.QuotaRefreshCoordinator
+	providers                *provider.Registry
+	cipher                   *security.Cipher
+	refreshes                singleflight.Group
+	billingSyncs             singleflight.Group
+	quotaSyncs               singleflight.Group
+	identitySyncs            singleflight.Group
+	observedModelWrites      singleflight.Group
+	observedModelStore       repository.ObservedModelStateRepository
+	refreshMu                sync.Mutex
+	lastRefreshAt            map[uint64]time.Time
+	observedModelShards      [observedModelLockShards]observedModelShard
+	quotaRefreshMu           sync.Mutex
+	quotaRefreshes           map[string]*quotaRefreshState
+	quotaRefreshQueue        chan quotaRefreshRequest
+	quotaRefreshWake         chan struct{}
+	webQuotaBackgroundMu     sync.Mutex
+	webQuotaBackgroundNextAt time.Time
+	webQuotaCooldowns        map[uint64]time.Time
+	conversionPool           *batch.Pool
+	syncPool                 *batch.Pool
+	webQuotaCatchupPool      *batch.Pool
+	refreshPool              *batch.Pool
 	// detectPool 专用于管理端「检测账号」，与额度同步/续期隔离，默认并发 32。
 	detectPool             *batch.Pool
 	credentialRefreshWake  chan struct{}
@@ -477,7 +533,7 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 	return &Service{
 		accounts: accounts, audits: audits, deviceSessions: deviceSessions, sticky: sticky,
 		providers: providers, cipher: cipher, refreshLock: refreshLock,
-		lastRefreshAt: make(map[uint64]time.Time), quotaRefreshes: make(map[string]*quotaRefreshState),
+		lastRefreshAt: make(map[uint64]time.Time), quotaRefreshes: make(map[string]*quotaRefreshState), webQuotaCooldowns: make(map[uint64]time.Time),
 		quotaRefreshQueue:     make(chan quotaRefreshRequest, quotaRefreshQueueSize),
 		quotaRefreshWake:      make(chan struct{}, 1),
 		credentialRefreshWake: make(chan struct{}, 1),
@@ -486,7 +542,7 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 		},
 		autoCleanWake:     make(chan struct{}, 1),
 		buildBotFlagCache: resultcache.New[string, []uint64](1, buildBotFlagCacheTTL),
-		conversionPool:    batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), detectPool: batch.NewPool(32),
+		conversionPool:    batch.NewPool(25), syncPool: batch.NewPool(25), webQuotaCatchupPool: batch.NewPool(webQuotaCatchupWorkers), refreshPool: batch.NewPool(25), detectPool: batch.NewPool(32),
 		logger: slog.Default(),
 		now:    func() time.Time { return time.Now().UTC() },
 	}
@@ -2966,6 +3022,87 @@ func (s *Service) RefreshWebQuota(ctx context.Context, id uint64) ([]accountdoma
 	return s.RefreshQuota(ctx, id)
 }
 
+func (s *Service) markWebQuotaSyncCooldown(ctx context.Context, accountID uint64, retryAt time.Time) error {
+	repository, ok := s.accounts.(webQuotaCooldownRepository)
+	if !ok {
+		return nil
+	}
+	return repository.MarkWebQuotaSyncCooldown(context.WithoutCancel(ctx), accountID, retryAt)
+}
+
+func (s *Service) recordWebQuotaForbidden(ctx context.Context, accountID uint64) {
+	retryAt := s.now().Add(webQuotaForbiddenCooldown)
+	s.webQuotaBackgroundMu.Lock()
+	if s.webQuotaCooldowns == nil {
+		s.webQuotaCooldowns = make(map[uint64]time.Time)
+	}
+	s.webQuotaCooldowns[accountID] = retryAt
+	s.webQuotaBackgroundMu.Unlock()
+	if err := s.markWebQuotaSyncCooldown(ctx, accountID, retryAt); err != nil {
+		s.logger.Warn("web_quota_cooldown_write_failed", "account_id", accountID, "retry_at", retryAt, "error", err)
+	}
+}
+
+func (s *Service) clearWebQuotaSyncCooldown(ctx context.Context, accountID uint64) {
+	s.webQuotaBackgroundMu.Lock()
+	delete(s.webQuotaCooldowns, accountID)
+	s.webQuotaBackgroundMu.Unlock()
+	repository, ok := s.accounts.(webQuotaCooldownRepository)
+	if !ok {
+		return
+	}
+	if err := repository.ClearWebQuotaSyncCooldown(context.WithoutCancel(ctx), accountID); err != nil {
+		s.logger.Warn("web_quota_cooldown_clear_failed", "account_id", accountID, "error", err)
+	}
+}
+
+func (s *Service) webQuotaCooldownRemaining(accountID uint64) time.Duration {
+	now := s.now().UTC()
+	s.webQuotaBackgroundMu.Lock()
+	defer s.webQuotaBackgroundMu.Unlock()
+	retryAt, ok := s.webQuotaCooldowns[accountID]
+	if !ok || !now.Before(retryAt) {
+		if ok {
+			delete(s.webQuotaCooldowns, accountID)
+		}
+		return 0
+	}
+	return retryAt.Sub(now)
+}
+
+// waitWebQuotaBackgroundTurn serializes the start of background Web quota
+// requests across both startup catch-up and quota-recovery paths. This is a
+// process-local guard; the persisted cooldown prevents the same account from
+// being selected again after a restart.
+func (s *Service) waitWebQuotaBackgroundTurn(ctx context.Context) error {
+	s.webQuotaBackgroundMu.Lock()
+	scheduled := time.Now().UTC()
+	if s.webQuotaBackgroundNextAt.After(scheduled) {
+		scheduled = s.webQuotaBackgroundNextAt
+	}
+	s.webQuotaBackgroundNextAt = scheduled.Add(webQuotaCatchupInterval)
+	s.webQuotaBackgroundMu.Unlock()
+	wait := time.Until(scheduled)
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func webQuotaCooldownError(retryAfter time.Duration) error {
+	if retryAfter <= 0 {
+		retryAfter = webQuotaForbiddenCooldown
+	}
+	return &webQuotaForbiddenRetryError{cause: provider.ErrQuotaForbidden, retryAfter: retryAfter}
+}
+
 func (s *Service) refreshQuota(ctx context.Context, id uint64) (quotaRefreshResult, error) {
 	value, err := s.accounts.Get(ctx, id)
 	if err != nil {
@@ -2977,6 +3114,10 @@ func (s *Service) refreshQuota(ctx context.Context, id uint64) (quotaRefreshResu
 	}
 	snapshot, err := adapter.SyncQuota(ctx, value)
 	if err != nil {
+		if value.Provider == accountdomain.ProviderWeb && errors.Is(err, provider.ErrQuotaForbidden) {
+			s.recordWebQuotaForbidden(ctx, value.ID)
+			err = wrapWebQuotaForbidden(err)
+		}
 		if errors.Is(err, provider.ErrUnauthorized) {
 			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, fmt.Sprintf("%s SSO credential rejected", value.Provider)))
 		}
@@ -2992,6 +3133,13 @@ func (s *Service) refreshQuota(ctx context.Context, id uint64) (quotaRefreshResu
 	}
 	if err := s.accounts.ReplaceQuotaWindows(ctx, id, snapshot.Tier, snapshot.SyncedAt, snapshot.Windows); err != nil {
 		return quotaRefreshResult{}, err
+	}
+	if value.Provider == accountdomain.ProviderWeb {
+		if snapshot.BackgroundForbidden {
+			s.recordWebQuotaForbidden(ctx, id)
+		} else {
+			s.clearWebQuotaSyncCooldown(ctx, id)
+		}
 	}
 	return quotaRefreshResult{Credential: value, Windows: snapshot.Windows}, nil
 }
@@ -3080,7 +3228,21 @@ func (s *Service) RefreshQuotaMode(ctx context.Context, id uint64, mode string) 
 // second event for the same account and mode. The recovery worker owns the
 // current claim and is responsible for acknowledging or rescheduling it.
 func (s *Service) ProbeQuotaMode(ctx context.Context, id uint64, mode string) (accountdomain.QuotaWindow, error) {
+	ctx = infraegress.WithClearanceSolveSuppressed(ctx)
 	mode = strings.TrimSpace(mode)
+	if retryAfter := s.webQuotaCooldownRemaining(id); retryAfter > 0 {
+		return accountdomain.QuotaWindow{}, webQuotaCooldownError(retryAfter)
+	}
+	if s.accounts != nil {
+		if credential, getErr := s.accounts.Get(ctx, id); getErr == nil && credential.Provider == accountdomain.ProviderWeb {
+			if err := s.waitWebQuotaBackgroundTurn(ctx); err != nil {
+				return accountdomain.QuotaWindow{}, err
+			}
+			if retryAfter := s.webQuotaCooldownRemaining(id); retryAfter > 0 {
+				return accountdomain.QuotaWindow{}, webQuotaCooldownError(retryAfter)
+			}
+		}
+	}
 	key := quotaSyncKey(id, mode)
 	result, err, _ := s.quotaSyncs.Do(key, func() (any, error) {
 		if isWebImagineQuotaMode(mode) {
@@ -3113,6 +3275,10 @@ func (s *Service) refreshQuotaGroup(ctx context.Context, id uint64, group string
 	}
 	snapshot, err := adapter.SyncQuotaGroup(ctx, value, group)
 	if err != nil {
+		if value.Provider == accountdomain.ProviderWeb && errors.Is(err, provider.ErrQuotaForbidden) {
+			s.recordWebQuotaForbidden(ctx, value.ID)
+			err = wrapWebQuotaForbidden(err)
+		}
 		if errors.Is(err, provider.ErrUnauthorized) {
 			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, fmt.Sprintf("%s SSO credential rejected", value.Provider)))
 		}
@@ -3126,6 +3292,9 @@ func (s *Service) refreshQuotaGroup(ctx context.Context, id uint64, group string
 	}
 	if err := s.accounts.ReplaceQuotaWindowGroup(ctx, id, snapshot.SyncedAt, snapshot.Modes, snapshot.Windows); err != nil {
 		return quotaRefreshResult{}, err
+	}
+	if value.Provider == accountdomain.ProviderWeb {
+		s.clearWebQuotaSyncCooldown(ctx, id)
 	}
 	return quotaRefreshResult{Credential: value, Windows: snapshot.Windows, Modes: snapshot.Modes}, nil
 }
@@ -3168,6 +3337,10 @@ func (s *Service) refreshQuotaMode(ctx context.Context, id uint64, mode string) 
 		syncedAt = s.now()
 	}
 	if err != nil {
+		if value.Provider == accountdomain.ProviderWeb && errors.Is(err, provider.ErrQuotaForbidden) {
+			s.recordWebQuotaForbidden(ctx, value.ID)
+			err = wrapWebQuotaForbidden(err)
+		}
 		if errors.Is(err, provider.ErrUnauthorized) {
 			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, fmt.Sprintf("%s SSO credential rejected", value.Provider)))
 		}
@@ -3188,6 +3361,9 @@ func (s *Service) refreshQuotaMode(ctx context.Context, id uint64, mode string) 
 		}
 	} else if err := s.accounts.SaveQuotaWindows(ctx, id, tier, syncedAt, windows); err != nil {
 		return quotaRefreshResult{}, err
+	}
+	if value.Provider == accountdomain.ProviderWeb {
+		s.clearWebQuotaSyncCooldown(ctx, id)
 	}
 	return quotaRefreshResult{Credential: value, Windows: windows}, nil
 }
@@ -3482,6 +3658,7 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 		}
 		if !skipUpstream && refreshErr == nil && acquired {
 			if err := s.syncPool.Do(ctx, func(workCtx context.Context) error {
+				workCtx = infraegress.WithClearanceSolveSuppressed(workCtx)
 				if refreshMode == accountdomain.QuotaGroupWebImagine {
 					var refreshed quotaRefreshResult
 					refreshed, refreshErr = s.refreshQuotaGroup(workCtx, request.accountID, refreshMode)
@@ -3504,7 +3681,7 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 			if refreshErr != nil && !errors.Is(refreshErr, context.Canceled) {
 				s.logger.Warn("quota_refresh_failed", "account_id", request.accountID, "mode", refreshMode, "error", refreshErr)
 			}
-			s.deferQuotaRefresh(request.key)
+			s.deferQuotaRefresh(request.key, provider.ErrorRetryAfter(refreshErr))
 			perfmetrics.Default.Add("quota_refresh_events", perfmetrics.Labels{Subsystem: "quota", Stage: "refresh", Outcome: "retry"}, 1)
 			return
 		}
@@ -3576,13 +3753,17 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 	}
 }
 
-func (s *Service) deferQuotaRefresh(key string) {
+func (s *Service) deferQuotaRefresh(key string, retryAfter ...time.Duration) {
 	s.quotaRefreshMu.Lock()
 	if state := s.quotaRefreshes[key]; state != nil {
 		state.running = false
 		state.pending = true
 		state.failures++
-		state.nextAttemptAt = s.now().UTC().Add(quotaRefreshRetryDelay(state.failures))
+		delay := quotaRefreshRetryDelay(state.failures)
+		if len(retryAfter) > 0 && retryAfter[0] > delay {
+			delay = retryAfter[0]
+		}
+		state.nextAttemptAt = s.now().UTC().Add(delay)
 	}
 	s.quotaRefreshMu.Unlock()
 	s.wakeQuotaRefreshRecovery()
@@ -3828,6 +4009,7 @@ func (s *Service) SyncIncompleteConsoleQuotas(ctx context.Context) (int, int, er
 		var batchSucceeded, batchFailed int
 		if len(pending) > 0 {
 			batchSucceeded, batchFailed, err = s.runAccountBatch(ctx, "console_usage_migration", pending, s.syncPool, nil, func(workCtx context.Context, id uint64) error {
+				workCtx = infraegress.WithClearanceSolveSuppressed(workCtx)
 				var release func()
 				if s.refreshLock != nil {
 					var acquired bool
@@ -3888,7 +4070,21 @@ func (s *Service) syncAllQuotasWithProgress(ctx context.Context, providerValue a
 
 // SyncWebQuotaAccounts 同步指定 Web 账号集合，供启动追赶任务复用共享并发池。
 func (s *Service) SyncWebQuotaAccounts(ctx context.Context, ids []uint64) (int, int, error) {
-	return s.runAccountBatch(ctx, "web_quota_startup_catchup", ids, s.syncPool, nil, func(workCtx context.Context, id uint64) error {
+	pool := s.webQuotaCatchupPool
+	if pool == nil {
+		pool = s.syncPool
+	}
+	return s.runAccountBatch(ctx, "web_quota_startup_catchup", ids, pool, nil, func(workCtx context.Context, id uint64) error {
+		workCtx = infraegress.WithClearanceSolveSuppressed(workCtx)
+		if retryAfter := s.webQuotaCooldownRemaining(id); retryAfter > 0 {
+			return webQuotaCooldownError(retryAfter)
+		}
+		if err := s.waitWebQuotaBackgroundTurn(workCtx); err != nil {
+			return err
+		}
+		if retryAfter := s.webQuotaCooldownRemaining(id); retryAfter > 0 {
+			return webQuotaCooldownError(retryAfter)
+		}
 		_, err := s.RefreshWebQuota(workCtx, id)
 		return err
 	})

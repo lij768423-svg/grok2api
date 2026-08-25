@@ -395,7 +395,7 @@ Resin 用户名支持 `{account}`：
 socks5h://Default.{account}:RESIN_PROXY_TOKEN@resin:2260
 ```
 
-占位符会替换为稳定的匿名身份。已关联的 Web、Build、Console 可共享该身份，不直接使用 Token 或 Email。
+占位符会替换为稳定的匿名身份。已关联的 Web 与 Build 保持历史身份；Console 使用独立的 `grok_console_` 命名空间（即使回退到 Web 节点也如此），因此不会跨渠道共享浏览器 Clearance 和 Cookie。不会直接使用 Token 或 Email。
 
 如需自动维护 Web/Console Cloudflare Clearance：
 

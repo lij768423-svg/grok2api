@@ -223,7 +223,7 @@ func (a *Adapter) forwardConsoleMedia(ctx context.Context, credential account.Cr
 		data, truncated, readErr := provider.ReadDiagnosticBody(response.Body)
 		_ = response.Body.Close()
 		dpopRequired := response.StatusCode == http.StatusForbidden && provider.IsDPoPProofRequiredBody(data)
-		if response.StatusCode == http.StatusForbidden && shouldInvalidateConsoleClearance(data) {
+		if response.StatusCode == http.StatusForbidden && shouldInvalidateConsoleClearance(response.Header, data) {
 			lease.InvalidateClearance()
 		}
 		if !dpopRequired {
@@ -666,7 +666,7 @@ func (a *Adapter) doConsoleVideoJSON(ctx context.Context, credential account.Cre
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		dpopRequired := response.StatusCode == http.StatusForbidden && provider.IsDPoPProofRequiredBody(data)
-		if response.StatusCode == http.StatusForbidden && shouldInvalidateConsoleClearance(data) {
+		if response.StatusCode == http.StatusForbidden && shouldInvalidateConsoleClearance(response.Header, data) {
 			lease.InvalidateClearance()
 		}
 		if !dpopRequired {

@@ -180,7 +180,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			cancel()
 			return nil, readErr
 		}
-		if shouldInvalidateConsoleClearance(data) {
+		if shouldInvalidateConsoleClearance(response.Header, data) {
 			lease.InvalidateClearance()
 			a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, response.StatusCode, nil)
 		}
@@ -254,10 +254,14 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	return result, nil
 }
 
-// shouldInvalidateConsoleClearance keeps account-level and protocol-level
-// rejections from being misclassified as a broken browser/egress binding.
-func shouldInvalidateConsoleClearance(body []byte) bool {
-	return !provider.IsDefinitiveAccountBlockBody(body) && !provider.IsDPoPProofRequiredBody(body)
+// shouldInvalidateConsoleClearance keeps account-level, protocol-level, and
+// ordinary application rejections from being misclassified as a broken
+// browser/egress binding. Only an explicit Cloudflare challenge is refreshable.
+func shouldInvalidateConsoleClearance(header http.Header, body []byte) bool {
+	if provider.IsDefinitiveAccountBlockBody(body) || provider.IsDPoPProofRequiredBody(body) {
+		return false
+	}
+	return provider.IsCloudflareChallengeResponse(header, body)
 }
 
 func normalizeConversationError(data []byte, operation string, status int) []byte {

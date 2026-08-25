@@ -372,7 +372,7 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 				body = body[:webMediaDiagnosticBodyLimit]
 			}
 			if upstream.StatusCode == http.StatusForbidden {
-				upstreamErr := newWebMediaUpstreamError(upstream.StatusCode, body, truncated)
+				upstreamErr := newWebMediaUpstreamErrorWithHeader(upstream.StatusCode, upstream.Header, body, truncated)
 				a.logWebMediaUpstreamRejection("image_lite_handshake", upstream, upstreamErr)
 				if isClearanceRefreshableMediaError(upstreamErr) {
 					// The failed WebSocket handshake invalidates the current browser
@@ -676,7 +676,7 @@ func (a *Adapter) generateWSImageAttempt(ctx context.Context, request provider.I
 			if truncated {
 				body = body[:webMediaDiagnosticBodyLimit]
 			}
-			upstreamErr := newWebMediaUpstreamError(response.StatusCode, body, truncated)
+			upstreamErr := newWebMediaUpstreamErrorWithHeader(response.StatusCode, http.Header(response.Header), body, truncated)
 			if isClearanceRefreshableMediaError(upstreamErr) {
 				lease.InvalidateClearance()
 			}
@@ -869,7 +869,7 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 		if truncated {
 			body = body[:webMediaDiagnosticBodyLimit]
 		}
-		upstreamErr := newWebMediaUpstreamError(response.StatusCode, body, truncated)
+		upstreamErr := newWebMediaUpstreamErrorWithHeader(response.StatusCode, response.Header, body, truncated)
 		a.logWebMediaUpstreamRejection("image_edit_generate", response, upstreamErr)
 		return nil, upstreamErr
 	}
@@ -1275,7 +1275,7 @@ func (a *Adapter) uploadFileV2Direct(ctx context.Context, cfg Config, lease *egr
 		if truncated {
 			responseBody = responseBody[:webMediaDiagnosticBodyLimit]
 		}
-		upstreamErr := newWebMediaUpstreamError(response.StatusCode, responseBody, truncated)
+		upstreamErr := newWebMediaUpstreamErrorWithHeader(response.StatusCode, response.Header, responseBody, truncated)
 		if isClearanceRefreshableMediaError(upstreamErr) {
 			lease.InvalidateClearance()
 		}
@@ -1435,7 +1435,7 @@ func parseMediaPostResponseWithDiagnostics(response *http.Response, onUpstreamEr
 		return "", provider.ErrUnauthorized
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		upstreamErr := newWebMediaUpstreamError(response.StatusCode, body, truncated)
+		upstreamErr := newWebMediaUpstreamErrorWithHeader(response.StatusCode, response.Header, body, truncated)
 		if onUpstreamError != nil {
 			onUpstreamError(upstreamErr)
 		}
@@ -1484,7 +1484,7 @@ func (a *Adapter) postJSONWithReferer(ctx context.Context, cfg Config, lease *eg
 			if truncated {
 				body = body[:webMediaDiagnosticBodyLimit]
 			}
-			upstreamErr := newWebMediaUpstreamError(response.StatusCode, body, truncated)
+			upstreamErr := newWebMediaUpstreamErrorWithHeader(response.StatusCode, response.Header, body, truncated)
 			response.Body = io.NopCloser(bytes.NewReader(body))
 			response.ContentLength = int64(len(body))
 			if isClearanceRefreshableMediaError(upstreamErr) {

@@ -286,17 +286,30 @@ type QualityGuardConfig struct {
 	RequestRetry QualityGuardRequestRetryConfig `yaml:"requestRetry"`
 }
 
-// QualityGuardRequestRetryConfig holds the in-process missing-thinking withhold policy.
+// QualityGuardRequestRetryConfig holds the in-process held-stream policies.
+// Enabled keeps the original missing-thinking retry behavior. BurstEnabled is
+// a separate Build-only high-TPS check and never opts Console into that path.
 type QualityGuardRequestRetryConfig struct {
-	Enabled         bool     `yaml:"enabled"`
-	MaxAttempts     int      `yaml:"maxAttempts"`
-	HoldTimeout     Duration `yaml:"holdTimeout"`
-	MinOutputTokens int      `yaml:"minOutputTokens"`
-	OnExhausted     string   `yaml:"onExhausted"`
-	AccountCooldown Duration `yaml:"accountCooldown"`
+	Enabled        bool `yaml:"enabled"`
+	ConsoleEnabled bool `yaml:"consoleEnabled"`
+	BurstEnabled   bool `yaml:"burstEnabled"`
+	// ModelPolicies is keyed by provider + upstream model, never public aliases.
+	// An omitted model stays unverified and therefore cannot enter the hold path.
+	ModelPolicies   []QualityGuardRequestRetryModelPolicy `yaml:"modelPolicies"`
+	MaxAttempts     int                                   `yaml:"maxAttempts"`
+	HoldTimeout     Duration                              `yaml:"holdTimeout"`
+	MinOutputTokens int                                   `yaml:"minOutputTokens"`
+	OnExhausted     string                                `yaml:"onExhausted"`
+	AccountCooldown Duration                              `yaml:"accountCooldown"`
 	// IdleAccountCooldown cools an account after a truly empty upstream
 	// stream. Independent of accountCooldown (missing-thinking). Zero uses 24h.
 	IdleAccountCooldown Duration `yaml:"idleAccountCooldown"`
+}
+
+type QualityGuardRequestRetryModelPolicy struct {
+	Provider      string `yaml:"provider"`
+	UpstreamModel string `yaml:"upstreamModel"`
+	State         string `yaml:"state"`
 }
 
 type ClientKeyDefaultsConfig struct {
@@ -782,7 +795,27 @@ func validateQualityGuardConfig(value QualityGuardConfig) error {
 }
 
 func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) error {
-	if !value.Enabled {
+	seenPolicies := make(map[string]struct{}, len(value.ModelPolicies))
+	for _, policy := range value.ModelPolicies {
+		provider := strings.TrimSpace(policy.Provider)
+		upstream := strings.TrimSpace(policy.UpstreamModel)
+		if provider != "grok_build" && provider != "grok_web" && provider != "grok_console" {
+			return errors.New("qualityGuard.requestRetry.modelPolicies.provider 无效")
+		}
+		if upstream == "" || len([]rune(upstream)) > 255 {
+			return errors.New("qualityGuard.requestRetry.modelPolicies.upstreamModel 无效")
+		}
+		state := strings.ToLower(strings.TrimSpace(policy.State))
+		if state != "enabled" && state != "disabled" && state != "unknown" {
+			return errors.New("qualityGuard.requestRetry.modelPolicies.state 必须是 enabled、disabled 或 unknown")
+		}
+		key := provider + "\x00" + strings.ToLower(upstream)
+		if _, exists := seenPolicies[key]; exists {
+			return errors.New("qualityGuard.requestRetry.modelPolicies 不得包含重复模型")
+		}
+		seenPolicies[key] = struct{}{}
+	}
+	if !value.Enabled && !value.BurstEnabled {
 		return nil
 	}
 	if value.MaxAttempts != 0 && (value.MaxAttempts < 1 || value.MaxAttempts > 6) {
@@ -931,14 +964,14 @@ func defaultConfig() Config {
 		},
 		QualityGuard: QualityGuardConfig{
 			Enabled: true,
-			Model: "grok-4.6", Mode: "passive",
+			Model:   "grok-4.6", Mode: "passive",
 			ActiveInterval: Duration(30 * time.Minute), PassivePollInterval: Duration(5 * time.Second),
 			SoftTPS: 500, HardTPS: 2500, ConsecutiveSoft: 2, ConsecutiveErrors: 2,
 			QuarantineDuration: Duration(5 * time.Minute), NoAccountBackoff: Duration(5 * time.Minute),
 			MinimumHealthyNodes: 1, MaxOutputTokens: 384,
 			MinimumGenerationWindow: Duration(time.Second), RotationTimeout: Duration(45 * time.Second),
 			RequestRetry: QualityGuardRequestRetryConfig{
-				Enabled: true,
+				Enabled:     true,
 				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
 				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
 			},

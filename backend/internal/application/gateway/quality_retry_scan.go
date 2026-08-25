@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
 const (
@@ -18,7 +19,11 @@ const (
 	qualityProtocolResponses   = "responses"
 	qualityProtocolAnthropic   = "anthropic"
 	qualityReasoningSSEComment = ": grok2api-reasoning-start"
-	qualityHoldMaxBufferBytes  = 4 << 20
+	// The conversation adapter emits this comment when the Responses upstream
+	// returned encrypted reasoning that is not representable in Chat/Anthropic
+	// JSON. Unlike the start marker, this is proof of actual thinking.
+	qualityEncryptedReasoningSSEComment = ": grok2api-reasoning-encrypted"
+	qualityHoldMaxBufferBytes           = 4 << 20
 )
 
 type qualityScanState struct {
@@ -27,11 +32,16 @@ type qualityScanState struct {
 	hasThinking      bool
 	reasoningStarted bool
 	visibleRunes     int
-	reasoningTokens  int64
-	outputTokens     int64
-	usage            Usage
-	responseID       string
-	terminal         bool
+	generatedRunes   int
+	// generationStartedAt follows the same start boundary as audit first-token
+	// timing: the internal reasoning marker, a reasoning item, or a real delta.
+	// It deliberately excludes route selection and upstream header latency.
+	generationStartedAt time.Time
+	reasoningTokens     int64
+	outputTokens        int64
+	usage               Usage
+	responseID          string
+	terminal            bool
 }
 
 type qualityReadResult struct {
@@ -150,6 +160,26 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 	}
 }
 
+func (s *qualityScanState) markGenerationStarted() {
+	if s != nil && s.generationStartedAt.IsZero() {
+		s.generationStartedAt = time.Now()
+	}
+}
+
+func (s *qualityScanState) burstOutputTokens() int64 {
+	if s == nil {
+		return 0
+	}
+	generated := int64((s.generatedRunes + 3) / 4)
+	if s.usage.Reported && s.usage.OutputTokens > generated {
+		generated = s.usage.OutputTokens
+	}
+	if s.outputTokens > generated {
+		generated = s.outputTokens
+	}
+	return generated
+}
+
 // ObserveQualityChunk feeds one SSE chunk into the hold classifier state.
 // This is the shipped scanner used by peekQualityStream.
 func ObserveQualityChunk(state *qualityScanState, chunk []byte) {
@@ -173,6 +203,13 @@ func ObserveQualityChunk(state *qualityScanState, chunk []byte) {
 		if bytes.Equal(line, []byte(qualityReasoningSSEComment)) {
 			// Timing stub only. 降智 still emits this, then usage.reasoning_tokens=0.
 			state.reasoningStarted = true
+			state.markGenerationStarted()
+			continue
+		}
+		if bytes.Equal(line, []byte(qualityEncryptedReasoningSSEComment)) {
+			state.hasThinking = true
+			state.reasoningStarted = true
+			state.markGenerationStarted()
 			continue
 		}
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -240,6 +277,9 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 		delta := choice.Delta
 		if delta.Reasoning != "" || delta.ReasoningContent != "" || delta.ThinkingContent != "" {
 			state.hasThinking = true
+			noteGeneratedContent(state, delta.Reasoning)
+			noteGeneratedContent(state, delta.ReasoningContent)
+			noteGeneratedContent(state, delta.ThinkingContent)
 		}
 		if delta.Content != "" {
 			noteVisibleContent(state, delta.Content)
@@ -262,6 +302,7 @@ func noteResponsesReasoningItem(state *qualityScanState, item qualityReasoningIt
 	}
 	if strings.TrimSpace(item.ID) != "" {
 		state.reasoningStarted = true
+		state.markGenerationStarted()
 	}
 	if strings.TrimSpace(item.EncryptedContent) != "" {
 		state.hasThinking = true
@@ -270,14 +311,14 @@ func noteResponsesReasoningItem(state *qualityScanState, item qualityReasoningIt
 
 func observeQualityResponses(state *qualityScanState, payload []byte) {
 	var event struct {
-		Type  string `json:"type"`
-		Delta string `json:"delta"`
-		Item  qualityReasoningItem
+		Type     string `json:"type"`
+		Delta    string `json:"delta"`
+		Item     qualityReasoningItem
 		Response *struct {
 			ID     string                 `json:"id"`
 			Model  string                 `json:"model"`
 			Output []qualityReasoningItem `json:"output"`
-			Usage *struct {
+			Usage  *struct {
 				OutputTokens        int64 `json:"output_tokens"`
 				InputTokens         int64 `json:"input_tokens"`
 				TotalTokens         int64 `json:"total_tokens"`
@@ -296,6 +337,7 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
 		if event.Delta != "" {
 			state.hasThinking = true
+			noteGeneratedContent(state, event.Delta)
 		}
 	case "response.output_item.added", "response.output_item.done":
 		noteResponsesReasoningItem(state, event.Item)
@@ -351,10 +393,12 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 	case "content_block_start":
 		if event.ContentBlock.Type == "thinking" {
 			state.reasoningStarted = true
+			state.markGenerationStarted()
 		}
 	case "content_block_delta":
 		if event.Delta.Type == "thinking_delta" && event.Delta.Thinking != "" {
 			state.hasThinking = true
+			noteGeneratedContent(state, event.Delta.Thinking)
 		}
 		if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
 			noteVisibleContent(state, event.Delta.Text)
@@ -373,66 +417,199 @@ func noteVisibleContent(state *qualityScanState, text string) {
 	if text == "" {
 		return
 	}
+	noteGeneratedContent(state, text)
 	state.visibleRunes += utf8.RuneCountInString(text)
 }
 
+func noteGeneratedContent(state *qualityScanState, text string) {
+	if state == nil || text == "" {
+		return
+	}
+	state.markGenerationStarted()
+	state.generatedRunes += utf8.RuneCountInString(text)
+}
+
+func (s *qualityScanState) qualityHoldDecision(cfg QualityRetryRuntime, holdExpired bool, upstreamStartedAt time.Time) QualityHoldDecision {
+	sig := s.signals()
+	sig.HoldExpired = holdExpired
+	base := QualityDeliver
+	if cfg.Enabled {
+		base = ClassifyQualityHold(sig, cfg.MinOutputTokens)
+		// Preserve the original missing-thinking behavior exactly: it remains a
+		// higher-priority held-stream result and keeps its durable strike path.
+		if base == QualityWithhold {
+			return QualityHoldDecision{Verdict: base, Reason: QualityDegradeMissingThinking, FirstGeneratedAt: s.generationStartedAt}
+		}
+	}
+	if !cfg.BurstEnabled {
+		return QualityHoldDecision{Verdict: base, FirstGeneratedAt: s.generationStartedAt}
+	}
+
+	burst, ready := s.burstAssessment(cfg, time.Now(), upstreamStartedAt)
+	if burst.Verdict == QualityWithhold {
+		return burst
+	}
+	if !ready {
+		// A thinking signal previously caused an immediate delivery. Keep the
+		// Build stream buffered only until the burst observation window closes.
+		return QualityHoldDecision{Verdict: QualityWait, FirstGeneratedAt: s.generationStartedAt}
+	}
+	if cfg.Enabled {
+		// The original missing-thinking classifier still owns the verdict once
+		// the independent burst observation has completed. Retain the measured
+		// burst timing for audit/logging so a buffered normal stream is not
+		// indistinguishable from an unmeasured one.
+		burst.Verdict = base
+		return burst
+	}
+	return QualityHoldDecision{Verdict: QualityDeliver, FirstGeneratedAt: s.generationStartedAt}
+}
+
+// burstStartedAt prefers the start of the upstream attempt over the local
+// scanner's first read. Build can buffer encrypted reasoning and release the
+// entire stream in one read; using that local read time would falsely turn a
+// 30-second normal thought process into a sub-millisecond token burst.
+func (s *qualityScanState) burstStartedAt(upstreamStartedAt time.Time) time.Time {
+	if !upstreamStartedAt.IsZero() && (s.generationStartedAt.IsZero() || upstreamStartedAt.Before(s.generationStartedAt)) {
+		return upstreamStartedAt
+	}
+	return s.generationStartedAt
+}
+
+// burstAssessment intentionally uses the full reported output count when it
+// is available. Its denominator is the upstream attempt elapsed time, matching
+// the normal audit/sidecar timing boundary rather than a buffered local read.
+func (s *qualityScanState) burstAssessment(cfg QualityRetryRuntime, now, upstreamStartedAt time.Time) (QualityHoldDecision, bool) {
+	decision := QualityHoldDecision{FirstGeneratedAt: s.generationStartedAt}
+	burstStartedAt := s.burstStartedAt(upstreamStartedAt)
+	if burstStartedAt.IsZero() {
+		return decision, s.terminal
+	}
+	outputTokens := s.burstOutputTokens()
+	if outputTokens <= 0 {
+		return decision, s.terminal
+	}
+	generationMS := now.Sub(burstStartedAt).Milliseconds()
+	if generationMS < 1 {
+		generationMS = 1
+	}
+	if !s.terminal && time.Duration(generationMS)*time.Millisecond < cfg.BurstMinGenerationWindow {
+		return decision, false
+	}
+	tps := audit.OutputTokensPerSecond(outputTokens, s.signals().ReasoningTokens, 0, generationMS)
+	decision.OutputTPS = tps
+	decision.GenerationMS = generationMS
+	if outputTokens >= cfg.MinOutputTokens && tps >= cfg.BurstHardTPS {
+		decision.Verdict = QualityWithhold
+		decision.Reason = QualityDegradeHardTPS
+	}
+	return decision, true
+}
+
 func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, error) {
+	// This legacy scanner helper historically classified missing thinking even
+	// when callers omitted Enabled. The gateway itself gates this call before
+	// reaching the scanner; retain the helper contract for focused tests while
+	// the detailed production path can run BurstEnabled by itself.
+	if !cfg.BurstEnabled {
+		cfg.Enabled = true
+	}
+	replay, decision, usage, responseID, err := peekQualityStreamDecision(ctx, body, protocol, cfg)
+	return replay, decision.Verdict, usage, responseID, err
+}
+
+func peekQualityStreamDecision(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime) (io.ReadCloser, QualityHoldDecision, Usage, string, error) {
+	return peekQualityStreamDecisionStarted(ctx, body, protocol, cfg, time.Time{})
+}
+
+// peekQualityStreamDecisionStarted accepts the upstream attempt start only for
+// the independent burst detector. The original missing-thinking classifier is
+// unchanged, and focused scanner tests may omit this value.
+func peekQualityStreamDecisionStarted(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime, upstreamStartedAt time.Time) (io.ReadCloser, QualityHoldDecision, Usage, string, error) {
 	cfg = normalizeQualityRetry(cfg)
 	if body == nil {
-		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", errQualityEmptyStream
+		return io.NopCloser(bytes.NewReader(nil)), QualityHoldDecision{Verdict: QualityWait}, Usage{}, "", errQualityEmptyStream
 	}
 	pump := newQualityReadPump(body)
 	state := qualityScanState{protocol: protocol}
 	var held bytes.Buffer
 	holdTimer := time.NewTimer(cfg.HoldTimeout)
 	defer holdTimer.Stop()
+	var burstTimer *time.Timer
+	var burstTimerC <-chan time.Time
+	defer func() {
+		if burstTimer != nil {
+			burstTimer.Stop()
+		}
+	}()
+	armBurstTimer := func() {
+		burstStartedAt := state.burstStartedAt(upstreamStartedAt)
+		if !cfg.BurstEnabled || burstTimer != nil || burstStartedAt.IsZero() || state.burstOutputTokens() <= 0 {
+			return
+		}
+		wait := time.Until(burstStartedAt.Add(cfg.BurstMinGenerationWindow))
+		if wait <= 0 {
+			return
+		}
+		burstTimer = time.NewTimer(wait)
+		burstTimerC = burstTimer.C
+	}
 	for {
-		sig := state.signals()
-		if verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
-			return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
+		if decision := state.qualityHoldDecision(cfg, false, upstreamStartedAt); decision.Verdict != QualityWait {
+			return newPrefixReplay(&held, pump), decision, state.usage, state.responseID, nil
 		}
 		// A completed empty stream must rotate immediately. Waiting for idle
 		// timeout after response.completed / [DONE] surfaces HTTP 200 with 0
 		// tokens and makes Grok TUI retry for 50–120s.
-		if sig.Terminal {
-			return finishQualityPeek(&held, pump, &state, cfg)
+		if state.terminal {
+			return finishQualityPeekDecision(&held, pump, &state, cfg, upstreamStartedAt)
 		}
+		armBurstTimer()
 
 		select {
 		case <-ctx.Done():
 			_ = pump.Close()
-			return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, qualityPeekAbortError(ctx, ctx.Err())
+			return io.NopCloser(bytes.NewReader(held.Bytes())), QualityHoldDecision{Verdict: QualityWait, FirstGeneratedAt: state.generationStartedAt}, state.usage, state.responseID, qualityPeekAbortError(ctx, ctx.Err())
 		case <-holdTimer.C:
-			sig.HoldExpired = true
-			if verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
-				return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
+			if decision := state.qualityHoldDecision(cfg, true, upstreamStartedAt); decision.Verdict != QualityWait {
+				return newPrefixReplay(&held, pump), decision, state.usage, state.responseID, nil
+			}
+		case <-burstTimerC:
+			burstTimerC = nil
+			if decision := state.qualityHoldDecision(cfg, false, upstreamStartedAt); decision.Verdict != QualityWait {
+				return newPrefixReplay(&held, pump), decision, state.usage, state.responseID, nil
 			}
 		case result, ok := <-pump.results:
 			if !ok {
-				return finishQualityPeek(&held, pump, &state, cfg)
+				return finishQualityPeekDecision(&held, pump, &state, cfg, upstreamStartedAt)
 			}
 			if len(result.data) > 0 {
 				if held.Len()+len(result.data) > qualityHoldMaxBufferBytes {
 					_, _ = held.Write(result.data)
-					return newPrefixReplay(&held, pump), QualityDeliver, state.usage, state.responseID, nil
+					return newPrefixReplay(&held, pump), QualityHoldDecision{Verdict: QualityDeliver, FirstGeneratedAt: state.generationStartedAt}, state.usage, state.responseID, nil
 				}
 				_, _ = held.Write(result.data)
 				ObserveQualityChunk(&state, result.data)
 			}
 			if result.err == io.EOF {
-				return finishQualityPeek(&held, pump, &state, cfg)
+				return finishQualityPeekDecision(&held, pump, &state, cfg, upstreamStartedAt)
 			}
 			if result.err != nil {
 				_ = pump.Close()
-				return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, qualityPeekAbortError(ctx, result.err)
+				return io.NopCloser(bytes.NewReader(held.Bytes())), QualityHoldDecision{Verdict: QualityWait, FirstGeneratedAt: state.generationStartedAt}, state.usage, state.responseID, qualityPeekAbortError(ctx, result.err)
 			}
 		}
 	}
 }
 
 func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *qualityScanState, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, error) {
+	replay, decision, usage, responseID, err := finishQualityPeekDecision(held, pump, state, cfg, time.Time{})
+	return replay, decision.Verdict, usage, responseID, err
+}
+
+func finishQualityPeekDecision(held *bytes.Buffer, pump *qualityReadPump, state *qualityScanState, cfg QualityRetryRuntime, upstreamStartedAt time.Time) (io.ReadCloser, QualityHoldDecision, Usage, string, error) {
 	if state == nil {
-		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", errQualityEmptyStream
+		return io.NopCloser(bytes.NewReader(nil)), QualityHoldDecision{Verdict: QualityWait}, Usage{}, "", errQualityEmptyStream
 	}
 	if len(state.pending) > 0 {
 		// Process a final valid SSE data line even when the upstream omitted its
@@ -442,9 +619,9 @@ func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *quality
 	state.terminal = true
 	signals := state.signals()
 	if !signals.HasThinking && signals.ReasoningTokens <= 0 && signals.OutputTokens <= 0 && signals.VisibleTokens <= 0 {
-		return newPrefixReplay(held, pump), QualityWait, state.usage, state.responseID, errQualityEmptyStream
+		return newPrefixReplay(held, pump), QualityHoldDecision{Verdict: QualityWait, FirstGeneratedAt: state.generationStartedAt}, state.usage, state.responseID, errQualityEmptyStream
 	}
-	return newPrefixReplay(held, pump), ClassifyQualityHold(signals, cfg.MinOutputTokens), state.usage, state.responseID, nil
+	return newPrefixReplay(held, pump), state.qualityHoldDecision(cfg, false, upstreamStartedAt), state.usage, state.responseID, nil
 }
 
 func newPrefixReplay(held *bytes.Buffer, rest io.ReadCloser) io.ReadCloser {
@@ -455,4 +632,51 @@ func newPrefixReplay(held *bytes.Buffer, rest io.ReadCloser) io.ReadCloser {
 		return rest
 	}
 	return &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(held.Bytes()), rest), source: rest}
+}
+
+// peekInitialStream withholds only enough of an SSE body to determine whether
+// the upstream emitted its first byte. This is deliberately separate from the
+// quality scanner: availability recovery must also work for models whose
+// quality guard is disabled or unverified.
+//
+// Once a byte is observed the pump remains the continuation reader, so the
+// caller can hand the response off without replaying a request after partial
+// output has become visible.
+func peekInitialStream(ctx context.Context, body io.ReadCloser) (io.ReadCloser, bool, error) {
+	if body == nil {
+		return io.NopCloser(bytes.NewReader(nil)), false, errUpstreamStreamEmpty
+	}
+	pump := newQualityReadPump(body)
+	var held bytes.Buffer
+	for {
+		select {
+		case <-ctx.Done():
+			_ = pump.Close()
+			return io.NopCloser(bytes.NewReader(held.Bytes())), false, qualityPeekAbortError(ctx, ctx.Err())
+		case result, ok := <-pump.results:
+			if !ok {
+				_ = pump.Close()
+				return io.NopCloser(bytes.NewReader(held.Bytes())), false, errUpstreamStreamEmpty
+			}
+			if len(result.data) > 0 {
+				_, _ = held.Write(result.data)
+				// Keep result.err (including EOF or an idle timeout) in the
+				// pump so it is surfaced only after the buffered bytes.
+				if result.err != nil {
+					pump.finalErr = result.err
+				}
+				return newPrefixReplay(&held, pump), true, nil
+			}
+			if result.err != nil {
+				_ = pump.Close()
+				if result.err == io.EOF {
+					return io.NopCloser(bytes.NewReader(held.Bytes())), false, errUpstreamStreamEmpty
+				}
+				if neterrorpkg.IsUpstreamStreamIdleTimeout(result.err) {
+					return io.NopCloser(bytes.NewReader(held.Bytes())), false, result.err
+				}
+				return io.NopCloser(bytes.NewReader(held.Bytes())), false, qualityPeekAbortError(ctx, result.err)
+			}
+		}
+	}
 }
