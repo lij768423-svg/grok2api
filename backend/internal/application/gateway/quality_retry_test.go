@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -383,6 +384,140 @@ func TestObserveQualityChunkEmptyReasoningStubIsNotThinking(t *testing.T) {
 	}
 }
 
+func TestQualityHoldDecisionPreservesMissingThinkingBeforeBurst(t *testing.T) {
+	t.Parallel()
+	state := qualityScanState{
+		protocol:            qualityProtocolChat,
+		visibleRunes:        160,
+		generatedRunes:      160,
+		outputTokens:        40,
+		terminal:            true,
+		generationStartedAt: time.Now().Add(-time.Millisecond),
+	}
+	decision := state.qualityHoldDecision(normalizeQualityRetry(QualityRetryRuntime{
+		Enabled:                  true,
+		BurstEnabled:             true,
+		MinOutputTokens:          32,
+		BurstHardTPS:             1,
+		BurstMinGenerationWindow: time.Second,
+	}), false, time.Time{})
+	if decision.Verdict != QualityWithhold || decision.Reason != QualityDegradeMissingThinking {
+		t.Fatalf("missing-thinking decision changed by burst guard: %#v", decision)
+	}
+}
+
+func TestQualityHoldDecisionWithBurstDisabledMatchesOriginalClassifier(t *testing.T) {
+	t.Parallel()
+	cfg := normalizeQualityRetry(QualityRetryRuntime{
+		Enabled:         true,
+		BurstEnabled:    false,
+		MinOutputTokens: 32,
+	})
+	fixtures := []qualityScanState{
+		{protocol: qualityProtocolChat, hasThinking: true, visibleRunes: 160},
+		{protocol: qualityProtocolChat, visibleRunes: 160, outputTokens: 40, terminal: true},
+		{protocol: qualityProtocolChat, visibleRunes: 12, outputTokens: 3, terminal: true},
+		{protocol: qualityProtocolChat, reasoningStarted: true, visibleRunes: 160},
+	}
+	for index, state := range fixtures {
+		want := ClassifyQualityHold(state.signals(), cfg.MinOutputTokens)
+		got := state.qualityHoldDecision(cfg, false, time.Time{})
+		if got.Verdict != want {
+			t.Fatalf("fixture %d: burst-disabled verdict = %s, want original %s (%#v)", index, got.Verdict, want, got)
+		}
+		if want == QualityWithhold && got.Reason != QualityDegradeMissingThinking {
+			t.Fatalf("fixture %d: original withhold must retain missing-thinking penalty, got %#v", index, got)
+		}
+		if want != QualityWithhold && got.Reason != QualityDegradeNone {
+			t.Fatalf("fixture %d: burst-disabled delivery/wait must have no new reason, got %#v", index, got)
+		}
+	}
+}
+
+func TestPeekQualityStreamDecisionWithholdsThinkingBurst(t *testing.T) {
+	t.Parallel()
+	content := strings.Repeat("abcd", 64)
+	body := io.NopCloser(strings.NewReader(sse(
+		": grok2api-reasoning-encrypted",
+		`data: {"choices":[{"delta":{"content":"`+content+`"}}]}`,
+		`data: {"usage":{"completion_tokens":64,"completion_tokens_details":{"reasoning_tokens":32}}}`,
+		"data: [DONE]",
+	)))
+	replay, decision, usage, _, err := peekQualityStreamDecision(context.Background(), body, qualityProtocolChat, QualityRetryRuntime{
+		// SG keeps the original missing-thinking retry disabled. The Build
+		// high-TPS check must remain independently effective in that mode.
+		Enabled:                  false,
+		BurstEnabled:             true,
+		MinOutputTokens:          32,
+		BurstHardTPS:             1,
+		BurstMinGenerationWindow: time.Second,
+		HoldTimeout:              time.Second,
+	})
+	if replay != nil {
+		defer replay.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !usage.Reported || usage.OutputTokens != 64 {
+		t.Fatalf("usage = %#v", usage)
+	}
+	if decision.Verdict != QualityWithhold || decision.Reason != QualityDegradeHardTPS || decision.OutputTPS <= 1 || decision.GenerationMS <= 0 {
+		t.Fatalf("thinking burst decision = %#v", decision)
+	}
+}
+
+func TestQualityHoldDecisionDeliversThinkingAfterBurstWindow(t *testing.T) {
+	t.Parallel()
+	state := qualityScanState{
+		protocol:            qualityProtocolChat,
+		hasThinking:         true,
+		generatedRunes:      160,
+		outputTokens:        40,
+		generationStartedAt: time.Now().Add(-20 * time.Millisecond),
+	}
+	decision := state.qualityHoldDecision(normalizeQualityRetry(QualityRetryRuntime{
+		Enabled:                  true,
+		BurstEnabled:             true,
+		MinOutputTokens:          32,
+		BurstHardTPS:             100000,
+		BurstMinGenerationWindow: 10 * time.Millisecond,
+	}), false, time.Time{})
+	if decision.Verdict != QualityDeliver || decision.Reason != QualityDegradeNone {
+		t.Fatalf("normal thinking stream must deliver after observation window: %#v", decision)
+	}
+}
+
+func TestQualityHoldDecisionUsesUpstreamAttemptDurationForBufferedThinking(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	state := qualityScanState{
+		protocol:            qualityProtocolChat,
+		hasThinking:         true,
+		generatedRunes:      4008,
+		outputTokens:        1002,
+		reasoningTokens:     985,
+		terminal:            true,
+		generationStartedAt: now.Add(-time.Millisecond),
+	}
+	cfg := normalizeQualityRetry(QualityRetryRuntime{
+		Enabled:                  true,
+		BurstEnabled:             true,
+		MinOutputTokens:          32,
+		BurstHardTPS:             1000,
+		BurstMinGenerationWindow: time.Second,
+	})
+	compressedRead := state.qualityHoldDecision(cfg, false, time.Time{})
+	if compressedRead.Verdict != QualityWithhold || compressedRead.Reason != QualityDegradeHardTPS {
+		t.Fatalf("fixture must reproduce a compressed local read: %#v", compressedRead)
+	}
+
+	delayedAttempt := state.qualityHoldDecision(cfg, false, now.Add(-18*time.Second))
+	if delayedAttempt.Verdict != QualityDeliver || delayedAttempt.Reason != QualityDegradeNone || delayedAttempt.OutputTPS >= cfg.BurstHardTPS || delayedAttempt.GenerationMS < 17_000 {
+		t.Fatalf("upstream attempt duration must prevent a buffered-thinking false positive: %#v", delayedAttempt)
+	}
+}
+
 func TestPeekQualityStreamThinkingDeliversRemainder(t *testing.T) {
 	t.Parallel()
 	body := io.NopCloser(strings.NewReader(sse(
@@ -746,6 +881,15 @@ func TestShouldHoldQualityStreamGates(t *testing.T) {
 	}
 	if !shouldHoldQualityStream(consoleInput, nil, consoleRoute, audit.OperationChat, consoleEnabled) {
 		t.Fatal("console reasoning streams must enter quality retry when their model is explicitly enabled")
+	}
+	burstOnly := consoleEnabled
+	burstOnly.Enabled = false
+	burstOnly.BurstEnabled = true
+	if shouldHoldQualityStream(consoleInput, nil, consoleRoute, audit.OperationChat, burstOnly) {
+		t.Fatal("Build burst guard must never opt Console into a held-stream retry")
+	}
+	if !shouldHoldQualityStream(input, nil, route, audit.OperationChat, burstOnly) {
+		t.Fatal("Build burst guard must remain eligible when missing-thinking retry is disabled")
 	}
 	off := cfg
 	off.Enabled = false
@@ -1152,7 +1296,74 @@ func TestAttemptLoopQualityFailOpenFallbackAndTotalAttemptCap(t *testing.T) {
 func TestNormalizeQualityRetryDefaults(t *testing.T) {
 	t.Parallel()
 	got := normalizeQualityRetry(QualityRetryRuntime{Enabled: true})
-	if !got.Enabled || got.MaxAttempts != 6 || got.MinOutputTokens != 8 || got.OnExhausted != qualityRetryFailClosed || got.HoldTimeout != 30*time.Second || got.AccountCooldown != 12*time.Hour || got.IdleAccountCooldown != 15*time.Minute {
+	if !got.Enabled || got.BurstEnabled || got.MaxAttempts != 6 || got.MinOutputTokens != 8 || got.OnExhausted != qualityRetryFailClosed || got.HoldTimeout != 30*time.Second || got.AccountCooldown != 12*time.Hour || got.IdleAccountCooldown != 15*time.Minute || got.BurstHardTPS != 2500 || got.BurstMinGenerationWindow != time.Second || got.BurstAccountCooldown != 5*time.Minute {
 		t.Fatalf("defaults = %#v", got)
+	}
+}
+
+func TestBurstTPSCooldownDoesNotCreateMissingThinkingStrike(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "burst-cooldown.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "burst-cooldown", SourceKey: "burst-cooldown",
+		EncryptedAccessToken: "access", EncryptedRefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	service := &Service{selector: selector, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	service.applyBurstTPSPenalty(ctx, "req-burst-cooldown", credential, time.Minute, 9000, 5)
+
+	updated, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Enabled || updated.LastError == lastErrorMissingThinking || updated.LastError == lastErrorMissingThinkingDisabled || updated.LastError != "upstream status 0" || updated.FailureCount != 0 || updated.CooldownUntil == nil {
+		t.Fatalf("burst cooldown must remain a short generic health mark: %#v", updated)
+	}
+}
+
+type qualityRetryAuditCapture struct {
+	records []audit.Record
+}
+
+func (c *qualityRetryAuditCapture) Create(_ context.Context, record audit.Record) error {
+	c.records = append(c.records, record)
+	return nil
+}
+
+func TestRecordQualityBurstTPSKeepsOriginalMissingThinkingAudit(t *testing.T) {
+	t.Parallel()
+	capture := &qualityRetryAuditCapture{}
+	service := &Service{audits: capture}
+	startedAt := time.Now().Add(-time.Second)
+	credential := accountdomain.Credential{ID: 11, Name: "quality-audit", Provider: accountdomain.ProviderBuild}
+
+	service.recordQualityDegradedDecision(context.Background(), audit.Record{RequestID: "burst-audit"}, credential, Usage{Reported: true, OutputTokens: 128}, startedAt, nil, accountdomain.ProviderBuild, QualityHoldDecision{
+		Reason: QualityDegradeHardTPS, FirstGeneratedAt: startedAt.Add(10 * time.Millisecond),
+	})
+	service.recordQualityDegradedDecision(context.Background(), audit.Record{RequestID: "thinking-audit"}, credential, Usage{Reported: true, OutputTokens: 128}, startedAt, nil, accountdomain.ProviderBuild, QualityHoldDecision{
+		Reason: QualityDegradeMissingThinking,
+	})
+
+	if len(capture.records) != 2 {
+		t.Fatalf("audit records = %#v", capture.records)
+	}
+	burst, thinking := capture.records[0], capture.records[1]
+	if burst.ErrorCode != audit.ErrorQualityBurstTPS || burst.FirstTokenMS == nil || *burst.FirstTokenMS != 10 {
+		t.Fatalf("burst audit = %#v", burst)
+	}
+	if thinking.ErrorCode != ErrorQualityDegraded || thinking.FirstTokenMS != nil {
+		t.Fatalf("missing-thinking audit changed = %#v", thinking)
 	}
 }

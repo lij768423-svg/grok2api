@@ -464,6 +464,18 @@ func TestAuditRepositoryNormalizesUntrustedUsage(t *testing.T) {
 	}
 }
 
+func TestNormalizedFirstTokenWhitelistsOnlyQualityBurstTPS(t *testing.T) {
+	firstToken := int64(25)
+	base := audit.Record{FirstTokenMS: &firstToken, Streaming: true, StatusCode: 200, DurationMS: 100}
+	if got := normalizedFirstToken(audit.Record{FirstTokenMS: base.FirstTokenMS, Streaming: base.Streaming, StatusCode: base.StatusCode, DurationMS: base.DurationMS, ErrorCode: "upstream_stream_interrupted"}); got != nil {
+		t.Fatalf("generic failed stream kept first token: %v", *got)
+	}
+	got := normalizedFirstToken(audit.Record{FirstTokenMS: base.FirstTokenMS, Streaming: base.Streaming, StatusCode: base.StatusCode, DurationMS: base.DurationMS, ErrorCode: audit.ErrorQualityBurstTPS})
+	if got == nil || *got != firstToken {
+		t.Fatalf("quality burst first token = %v, want %d", got, firstToken)
+	}
+}
+
 func TestAuditRepositorySummaryAppliesRangeAndGroupsPricingTier(t *testing.T) {
 	ctx := context.Background()
 	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "audit-summary.db"))

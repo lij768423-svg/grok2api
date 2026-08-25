@@ -86,6 +86,22 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual((classification, reason, output), ("hard", "buffered_burst", 2000))
         self.assertEqual(speed, 20000)
 
+    def test_passive_accepts_only_dedicated_gateway_burst_audit(self):
+        cfg = config()
+        sample = {
+            "provider": "grok_build", "streaming": True, "statusCode": 200,
+            "firstTokenMs": 5, "durationMs": 105,
+            "outputTokens": 2000, "reasoningTokens": 0,
+        }
+        self.assertEqual(
+            quality_guard.classify_audit({**sample, "errorCode": "quality_burst_tps"}, cfg)[:2],
+            ("hard", "hard_tps"),
+        )
+        self.assertEqual(
+            quality_guard.classify_audit({**sample, "errorCode": "quality_degraded"}, cfg)[:2],
+            ("ignored", "unsuccessful"),
+        )
+
     def test_passive_audit_does_not_infer_thinking_requirement(self):
         cfg = config(fail_closed=True, min_generation_ms=1000)
         base = {

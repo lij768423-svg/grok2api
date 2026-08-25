@@ -1176,6 +1176,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		lease             *accountLease
 		credential        accountdomain.Credential
 		usage             Usage
+		decision          QualityHoldDecision
 		upstreamStartedAt time.Time
 	}
 	var fallback *qualityFallback
@@ -1184,7 +1185,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			return
 		}
 		if recordDegraded {
-			s.recordQualityDegraded(ctx, auditBase, fallback.credential, fallback.usage, startedAt, egressTrace, route.Provider)
+			s.recordQualityDegradedDecision(ctx, auditBase, fallback.credential, fallback.usage, startedAt, egressTrace, route.Provider, fallback.decision)
 			failureAttempts.captureQualityDegraded(fallback.credential, fallback.upstreamStartedAt)
 		}
 		_ = fallback.response.Body.Close()
@@ -1564,7 +1565,8 @@ attemptLoop:
 			}
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			if qualityHoldEnabled {
-				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
+				replay, decision, peekUsage, _, peekErr := peekQualityStreamDecisionStarted(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg, responseStartedAt)
+				verdict := decision.Verdict
 				if peekErr != nil {
 					if replay != nil {
 						_ = replay.Close()
@@ -1601,42 +1603,56 @@ attemptLoop:
 				hasNextAccount = hasNextAccount && qualityAccountAttempts < holdCfg.MaxAttempts
 				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
 				if verdict == QualityWithhold {
-					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown)
+					if decision.Reason == QualityDegradeHardTPS {
+						s.applyBurstTPSPenalty(ctx, input.RequestID, credential, holdCfg.BurstAccountCooldown, decision.OutputTPS, decision.GenerationMS)
+					} else {
+						s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown)
+					}
 				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
-					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider)
+					s.recordQualityDegradedDecision(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider, decision)
 					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
 				}
 				switch commit.Action {
 				case QualityActionRetry:
 					if deferFailOpenAudit {
 						discardFallback(true)
-						fallback = &qualityFallback{response: response, lease: lease, credential: credential, usage: peekUsage, upstreamStartedAt: responseStartedAt}
+						fallback = &qualityFallback{response: response, lease: lease, credential: credential, usage: peekUsage, decision: decision, upstreamStartedAt: responseStartedAt}
 						lease.completeSelectorObservation(true)
 						lease.Release()
 					} else {
 						_ = response.Body.Close()
 						lease.Release()
 					}
-					lastErr = errQualityDegraded
+					degradeErr := qualityDegradeError(decision.Reason)
+					lastErr = degradeErr
 					lastFailure = &UpstreamFailure{
 						HTTPStatus: http.StatusServiceUnavailable, Code: ErrorQualityDegraded,
-						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
-						Cause: errQualityDegraded,
+						PublicMessage: qualityDegradePublicMessage(decision.Reason), AccountID: credential.ID, AccountName: credential.Name,
+						Cause: degradeErr,
 					}
-					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+					logEvent := "quality_degraded_retry"
+					if decision.Reason == QualityDegradeHardTPS {
+						logEvent = "quality_burst_tps_retry"
+					}
+					s.logger.Info(logEvent, "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "output_tps", decision.OutputTPS, "generation_ms", decision.GenerationMS)
 					continue
 				case QualityActionReject:
 					_ = response.Body.Close()
 					lease.Release()
-					lastErr = errQualityDegraded
+					degradeErr := qualityDegradeError(decision.Reason)
+					lastErr = degradeErr
 					lastFailure = &UpstreamFailure{
 						HTTPStatus: http.StatusServiceUnavailable, Code: ErrorQualityDegraded,
-						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
-						Cause: errQualityDegraded,
+						PublicMessage: qualityDegradePublicMessage(decision.Reason), AccountID: credential.ID, AccountName: credential.Name,
+						Cause: degradeErr,
 					}
-					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID)
+					logEvent := "quality_degraded_rejected"
+					if decision.Reason == QualityDegradeHardTPS {
+						logEvent = "quality_burst_tps_rejected"
+					}
+					s.logger.Info(logEvent, "request_id", input.RequestID, "account_id", credential.ID, "output_tokens", peekUsage.OutputTokens, "output_tps", decision.OutputTPS, "generation_ms", decision.GenerationMS)
 					break attemptLoop
 				case QualityActionDeliverLast:
 					discardFallback(true)

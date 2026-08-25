@@ -6,6 +6,9 @@ const (
 	DegradeClassHard     = "hard_tps"
 	DegradeClassThinking = "missing_thinking"
 	ErrorQualityDegraded = "quality_degraded"
+	// ErrorQualityBurstTPS marks a discarded stream that already passed the
+	// upstream HTTP boundary but exceeded the request-path hard TPS guard.
+	ErrorQualityBurstTPS = "quality_burst_tps"
 )
 
 const (

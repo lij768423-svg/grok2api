@@ -535,7 +535,10 @@ func nonNegative(value int64) int64 {
 }
 
 func normalizedFirstToken(value audit.Record) *int64 {
-	if value.FirstTokenMS == nil || !value.Streaming || value.StatusCode < 200 || value.StatusCode >= 300 || value.ErrorCode != "" {
+	// quality_burst_tps is a locally discarded upstream 2xx sample. Retain its
+	// timing so the degradation dashboard and passive guard can classify the
+	// egress event. Other error records remain timing-less as before.
+	if value.FirstTokenMS == nil || !value.Streaming || value.StatusCode < 200 || value.StatusCode >= 300 || (value.ErrorCode != "" && value.ErrorCode != audit.ErrorQualityBurstTPS) {
 		return nil
 	}
 	normalized := nonNegative(*value.FirstTokenMS)
@@ -925,9 +928,14 @@ func (r *AuditRepository) degradeClassifiedQuery(tx *gorm.DB, input repository.D
 	tpsExpression := fmt.Sprintf("(CAST(a.output_tokens AS %s) * 1000.0 / NULLIF(%s, 0))", castType, generationExpression)
 	selectTPS := fmt.Sprintf("CASE WHEN a.error_code = ? THEN 0 ELSE %s END", tpsExpression)
 	classExpression := fmt.Sprintf("CASE WHEN a.error_code = ? THEN ? WHEN ? AND %s < ? THEN ? WHEN %s >= ? THEN ? ELSE ? END", generationExpression, tpsExpression)
+	// A quality_burst_tps row is a discarded upstream 2xx response, not a
+	// client-visible success. Include it only in the degradation speed view so
+	// the dashboard and sidecar can track the egress anomaly without making
+	// arbitrary failed streams look healthy.
+	qualitySamplePredicate := "a.status_code >= 200 AND a.status_code < 300 AND (a.error_code IS NULL OR a.error_code = '' OR a.error_code = ?)"
 	speedPredicate := fmt.Sprintf(
 		"a.streaming = ? AND %s AND a.output_tokens >= ? AND a.first_token_ms IS NOT NULL AND a.duration_ms > a.first_token_ms AND %s >= ?",
-		auditSuccessPredicate, tpsExpression,
+		qualitySamplePredicate, tpsExpression,
 	)
 	thinkingPredicate := "a.streaming = ? AND a.error_code = ? AND a.status_code >= 200 AND a.status_code < 300"
 	query := tx.Table("request_audits AS a").
@@ -937,7 +945,7 @@ func (r *AuditRepository) degradeClassifiedQuery(tx *gorm.DB, input repository.D
 		Where("a.provider = ?", "grok_build").
 		Where("a.request_id NOT LIKE ?", "quality_%").
 		Where("(("+speedPredicate+") OR ("+thinkingPredicate+"))",
-			true, input.MinOutputTokens, input.SoftTPS,
+			true, audit.ErrorQualityBurstTPS, input.MinOutputTokens, input.SoftTPS,
 			true, audit.ErrorQualityDegraded)
 	if !input.Start.IsZero() {
 		query = query.Where("a.created_at >= ?", input.Start)

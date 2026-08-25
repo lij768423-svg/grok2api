@@ -353,7 +353,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	modelRepo.SetInvalidationObserver(invalidationService.Notify)
 	clientKeyRepo.SetInvalidationObserver(invalidationService.Notify)
 	gatewayService := gateway.NewService(modelService, auditService, accountService, clientKeyService, providers, selector, responseRepo, cfg.Routing.MaxAttempts)
-	gatewayService.UpdateQualityRetry(qualityRetryRuntime(cfg.QualityGuard.RequestRetry))
+	gatewayService.UpdateQualityRetry(qualityRetryRuntime(cfg.QualityGuard))
 	gatewayService.UpdateVideoMaxAttempts(cfg.Routing.VideoMaxAttempts)
 	gatewayService.UpdateMarkBuildChatDeniedAsReauth(cfg.Routing.MarkBuildChatDeniedAsReauth)
 	gatewayService.SetLogger(logger)
@@ -410,7 +410,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		egressManager.UpdateAccountIsolatedConnections(next.Routing.AccountIsolatedConnections)
 		reasoningReplay.UpdateConfig(reasoningreplay.Config{Enabled: next.Routing.ReasoningReplayEnabled, TTL: next.Routing.ReasoningReplayTTL.Value()})
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
-		gatewayService.UpdateQualityRetry(qualityRetryRuntime(next.QualityGuard.RequestRetry))
+		gatewayService.UpdateQualityRetry(qualityRetryRuntime(next.QualityGuard))
 		gatewayService.UpdateVideoMaxAttempts(next.Routing.VideoMaxAttempts)
 		gatewayService.UpdateMarkBuildChatDeniedAsReauth(next.Routing.MarkBuildChatDeniedAsReauth)
 		gatewayService.UpdateBuildForbiddenReauthPolicy(next.Accounts.MarkBuildForbiddenReauth, next.Accounts.BuildForbiddenReauthCodes)
@@ -490,9 +490,10 @@ func accountAutoCleanConfig(value config.AccountsConfig) accountapp.AutoCleanCon
 	}
 }
 
-func qualityRetryRuntime(value config.QualityGuardRequestRetryConfig) gateway.QualityRetryRuntime {
-	policies := make(map[string]modeldomain.QualityGuardModelState, len(value.ModelPolicies))
-	for _, policy := range value.ModelPolicies {
+func qualityRetryRuntime(value config.QualityGuardConfig) gateway.QualityRetryRuntime {
+	retry := value.RequestRetry
+	policies := make(map[string]modeldomain.QualityGuardModelState, len(retry.ModelPolicies))
+	for _, policy := range retry.ModelPolicies {
 		providerValue := account.Provider(strings.TrimSpace(policy.Provider))
 		upstream, ok := modeldomain.NormalizeUpstreamModel(providerValue, policy.UpstreamModel)
 		if !ok {
@@ -505,15 +506,19 @@ func qualityRetryRuntime(value config.QualityGuardRequestRetryConfig) gateway.Qu
 		policies[modeldomain.QualityGuardModelKey(providerValue, upstream)] = state
 	}
 	return gateway.QualityRetryRuntime{
-		Enabled:             value.Enabled,
-		ConsoleEnabled:      value.ConsoleEnabled,
-		ModelPolicies:       policies,
-		MaxAttempts:         value.MaxAttempts,
-		HoldTimeout:         value.HoldTimeout.Value(),
-		MinOutputTokens:     int64(value.MinOutputTokens),
-		OnExhausted:         value.OnExhausted,
-		AccountCooldown:     value.AccountCooldown.Value(),
-		IdleAccountCooldown: value.IdleAccountCooldown.Value(),
+		Enabled:                  retry.Enabled,
+		ConsoleEnabled:           retry.ConsoleEnabled,
+		BurstEnabled:             value.Enabled && retry.BurstEnabled,
+		BurstHardTPS:             value.HardTPS,
+		BurstMinGenerationWindow: value.MinimumGenerationWindow.Value(),
+		BurstAccountCooldown:     value.QuarantineDuration.Value(),
+		ModelPolicies:            policies,
+		MaxAttempts:              retry.MaxAttempts,
+		HoldTimeout:              retry.HoldTimeout.Value(),
+		MinOutputTokens:          int64(retry.MinOutputTokens),
+		OnExhausted:              retry.OnExhausted,
+		AccountCooldown:          retry.AccountCooldown.Value(),
+		IdleAccountCooldown:      retry.IdleAccountCooldown.Value(),
 	}
 }
 

@@ -155,6 +155,9 @@ qualityGuard:
     # Console streams stay outside this path unless explicitly enabled from the
     # Quality Guard page (or set to true here before first startup).
     consoleEnabled: false
+    # Independent Build-only high-TPS guard. It uses hardTPS and
+    # minimumGenerationWindow above; Console is never included.
+    burstEnabled: false
     maxAttempts: 6
     holdTimeout: 30s
     minOutputTokens: 8

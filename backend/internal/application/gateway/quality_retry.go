@@ -24,6 +24,9 @@ const (
 	defaultQualityHoldTimeout        = 30 * time.Second
 	defaultQualityMinOutput          = int64(8)
 	defaultMissingThinkingCooldown   = 12 * time.Hour
+	defaultBurstAccountCooldown      = 5 * time.Minute
+	defaultBurstHardTPS              = 2500.0
+	defaultBurstGenerationWindow     = time.Second
 	lastErrorMissingThinking         = accountdomain.LastErrorMissingThinking
 	lastErrorMissingThinkingDisabled = accountdomain.LastErrorMissingThinkingDisabled
 	// An empty stream that idles while held is treated as an account-quality
@@ -33,6 +36,7 @@ const (
 
 var (
 	errQualityDegraded     = errors.New("上游响应缺少推理")
+	errQualityBurstTPS     = errors.New("上游响应输出速率异常")
 	errUpstreamStreamEmpty = errors.New("上游流式响应为空")
 	// Keep the old name for quality-hold callers and tests. Empty-stream
 	// recovery is an availability concern even when quality guard is disabled.
@@ -47,6 +51,13 @@ var (
 type QualityRetryRuntime struct {
 	Enabled        bool
 	ConsoleEnabled bool
+	// BurstEnabled is an independent Build-only guard for a stream whose output
+	// rate exceeds the quality-guard hard TPS threshold. It deliberately does
+	// not opt Console into any request-path retry behavior.
+	BurstEnabled             bool
+	BurstHardTPS             float64
+	BurstMinGenerationWindow time.Duration
+	BurstAccountCooldown     time.Duration
 	// ModelPolicies contains only explicit operator overrides. A missing key is
 	// resolved through model.DefaultQualityGuardModelState and is fail-closed.
 	ModelPolicies   map[string]modeldomain.QualityGuardModelState
@@ -84,6 +95,26 @@ const (
 	QualityWithhold QualityVerdict = "withhold"
 )
 
+// QualityDegradeReason keeps the original missing-thinking strike behavior
+// separate from a short-lived high-TPS egress cooldown.
+type QualityDegradeReason string
+
+const (
+	QualityDegradeNone            QualityDegradeReason = ""
+	QualityDegradeMissingThinking QualityDegradeReason = "missing_thinking"
+	QualityDegradeHardTPS         QualityDegradeReason = "hard_tps"
+)
+
+// QualityHoldDecision is the detailed held-stream result. QualityVerdict is
+// retained for the original retry control flow and existing callers.
+type QualityHoldDecision struct {
+	Verdict          QualityVerdict
+	Reason           QualityDegradeReason
+	OutputTPS        float64
+	GenerationMS     int64
+	FirstGeneratedAt time.Time
+}
+
 // QualityRetryAction is what the attempt loop does with a withhold verdict.
 type QualityRetryAction string
 
@@ -109,6 +140,15 @@ func normalizeQualityRetry(cfg QualityRetryRuntime) QualityRetryRuntime {
 	}
 	if cfg.IdleAccountCooldown <= 0 {
 		cfg.IdleAccountCooldown = qualityIdleAccountCooldown
+	}
+	if cfg.BurstHardTPS <= 0 {
+		cfg.BurstHardTPS = defaultBurstHardTPS
+	}
+	if cfg.BurstMinGenerationWindow <= 0 {
+		cfg.BurstMinGenerationWindow = defaultBurstGenerationWindow
+	}
+	if cfg.BurstAccountCooldown <= 0 {
+		cfg.BurstAccountCooldown = defaultBurstAccountCooldown
 	}
 	cfg.OnExhausted = normalizeQualityExhaustionPolicy(cfg.OnExhausted)
 	if cfg.ModelPolicies == nil {
@@ -289,7 +329,7 @@ func CommitQualityHold(verdict QualityVerdict, qualityAttempt, maxAttempts int, 
 }
 
 func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwnership, route modeldomain.Route, operation audit.Operation, cfg QualityRetryRuntime) bool {
-	if !cfg.Enabled || !input.Streaming || input.ForcedEgressNodeID != 0 || ownership != nil || input.skipQualityHold {
+	if (!cfg.Enabled && !(cfg.BurstEnabled && route.Provider == accountdomain.ProviderBuild)) || !input.Streaming || input.ForcedEgressNodeID != 0 || ownership != nil || input.skipQualityHold {
 		return false
 	}
 	switch operation {
@@ -303,16 +343,19 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 	if isResponsesCompactionRequest(input.Body) {
 		return false
 	}
-	// Build remains enabled by the requestRetry policy. Console is opt-in: its
-	// Responses-to-Chat conversion can delay the reasoning usage frame until
-	// after visible text, so it must never enter this path accidentally.
+	// Burst mode is Build-only. Console remains opt-in only for the original
+	// missing-thinking policy: its Responses-to-Chat conversion can delay the
+	// reasoning usage frame until after visible text.
 	switch route.Provider {
 	case accountdomain.ProviderBuild:
 	case accountdomain.ProviderConsole:
-		if !cfg.ConsoleEnabled {
+		if !cfg.Enabled || !cfg.ConsoleEnabled {
 			return false
 		}
 	case accountdomain.ProviderWeb:
+		if !cfg.Enabled {
+			return false
+		}
 		// Web is supported only when a verified model policy explicitly opts it in.
 	default:
 		return false
@@ -436,7 +479,38 @@ func (s *Service) applyMissingThinkingPenalty(ctx context.Context, requestID str
 	}
 }
 
+// applyBurstTPSPenalty uses the generic soft-failure cooldown. A high output
+// rate is an egress/session signal, not a durable missing-thinking strike, so
+// it must never feed the original disable-after-second-strike path.
+func (s *Service) applyBurstTPSPenalty(ctx context.Context, requestID string, credential accountdomain.Credential, cooldown time.Duration, outputTPS float64, generationMS int64) {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+	defer cancel()
+	if err := s.selector.MarkFailureAfterSuccess(writeCtx, credential, 0, cooldown); err != nil {
+		s.logger.Error("quality_burst_tps_penalty_failed", "request_id", requestID, "account_id", credential.ID, "error", err)
+		return
+	}
+	s.logger.Info("quality_burst_tps_cooldown", "request_id", requestID, "account_id", credential.ID, "cooldown", cooldown.String(), "output_tps", outputTPS, "generation_ms", generationMS)
+}
+
+func qualityDegradeError(reason QualityDegradeReason) error {
+	if reason == QualityDegradeHardTPS {
+		return errQualityBurstTPS
+	}
+	return errQualityDegraded
+}
+
+func qualityDegradePublicMessage(reason QualityDegradeReason) string {
+	if reason == QualityDegradeHardTPS {
+		return "上游响应输出速率异常"
+	}
+	return "上游响应缺少推理"
+}
+
 func (s *Service) recordQualityDegraded(ctx context.Context, base audit.Record, credential accountdomain.Credential, usage Usage, startedAt time.Time, trace *infraegress.Trace, provider accountdomain.Provider) {
+	s.recordQualityDegradedDecision(ctx, base, credential, usage, startedAt, trace, provider, QualityHoldDecision{})
+}
+
+func (s *Service) recordQualityDegradedDecision(ctx context.Context, base audit.Record, credential accountdomain.Credential, usage Usage, startedAt time.Time, trace *infraegress.Trace, provider accountdomain.Provider, decision QualityHoldDecision) {
 	record := base
 	record.EventID = newAuditEventID()
 	accountID := credential.ID
@@ -444,12 +518,25 @@ func (s *Service) recordQualityDegraded(ctx context.Context, base audit.Record, 
 	record.AccountName = credential.Name
 	record.StatusCode = http.StatusOK
 	record.ErrorCode = ErrorQualityDegraded
+	if decision.Reason == QualityDegradeHardTPS {
+		record.ErrorCode = audit.ErrorQualityBurstTPS
+	}
 	record.OutputTokens = usage.OutputTokens
 	record.ReasoningTokens = usage.ReasoningTokens
 	record.TotalTokens = usage.TotalTokens
 	record.InputTokens = usage.InputTokens
 	if usage.Reported {
 		record.UsageSource = audit.UsageSourceUpstream
+	}
+	// The original missing-thinking audit shape remains unchanged. A discarded
+	// high-TPS stream includes timing so the passive sidecar can independently
+	// quarantine the same egress node.
+	if decision.Reason == QualityDegradeHardTPS && !decision.FirstGeneratedAt.IsZero() {
+		firstTokenMS := decision.FirstGeneratedAt.Sub(startedAt).Milliseconds()
+		if firstTokenMS < 0 {
+			firstTokenMS = 0
+		}
+		record.FirstTokenMS = &firstTokenMS
 	}
 	record.DurationMS = time.Since(startedAt).Milliseconds()
 	record.CreatedAt = time.Now().UTC()

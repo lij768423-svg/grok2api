@@ -478,7 +478,11 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, flo
     if value.get("provider") != "grok_build" or not bool(value.get("streaming")):
         return "ignored", "not_build_stream", 0.0, 0
     status = int(value.get("statusCode") or 0)
-    if status < 200 or status >= 300 or value.get("errorCode"):
+    # The gateway records a rejected hard-TPS sample with this dedicated code.
+    # Keep every other failed audit out of passive egress classification, in
+    # particular the original missing-thinking quality_degraded records.
+    error_code = str(value.get("errorCode") or "")
+    if status < 200 or status >= 300 or error_code not in {"", "quality_burst_tps"}:
         return "ignored", "unsuccessful", 0.0, 0
     first_token_ms = value.get("firstTokenMs")
     if first_token_ms is None:

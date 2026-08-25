@@ -286,13 +286,13 @@ type QualityGuardConfig struct {
 	RequestRetry QualityGuardRequestRetryConfig `yaml:"requestRetry"`
 }
 
-// QualityGuardRequestRetryConfig holds the in-process missing-thinking withhold policy.
-// ConsoleEnabled opts Console reasoning streams into the retry path. It
-// defaults to false because Console emits a delayed usage frame after its
-// Responses-to-Chat SSE conversion.
+// QualityGuardRequestRetryConfig holds the in-process held-stream policies.
+// Enabled keeps the original missing-thinking retry behavior. BurstEnabled is
+// a separate Build-only high-TPS check and never opts Console into that path.
 type QualityGuardRequestRetryConfig struct {
 	Enabled        bool `yaml:"enabled"`
 	ConsoleEnabled bool `yaml:"consoleEnabled"`
+	BurstEnabled   bool `yaml:"burstEnabled"`
 	// ModelPolicies is keyed by provider + upstream model, never public aliases.
 	// An omitted model stays unverified and therefore cannot enter the hold path.
 	ModelPolicies   []QualityGuardRequestRetryModelPolicy `yaml:"modelPolicies"`
@@ -815,7 +815,7 @@ func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) erro
 		}
 		seenPolicies[key] = struct{}{}
 	}
-	if !value.Enabled {
+	if !value.Enabled && !value.BurstEnabled {
 		return nil
 	}
 	if value.MaxAttempts != 0 && (value.MaxAttempts < 1 || value.MaxAttempts > 6) {

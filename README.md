@@ -370,6 +370,9 @@ qualityGuard:
   # 3s cuts those as missing-thinking (HTTP 200 · error in audits).
   requestRetry:
     enabled: true
+    # Independent Build-only high-TPS guard. It uses hardTPS and
+    # minimumGenerationWindow above; Console is never included.
+    burstEnabled: false
     maxAttempts: 6
     holdTimeout: 30s
     minOutputTokens: 8
