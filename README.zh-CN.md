@@ -24,7 +24,39 @@
 > 推荐个人新项目 [DEEIX-AI / DEEIX-Chat](https://github.com/DEEIX-AI/DEEIX-Chat)：面向多模型路由、对话、文件、工具、计费与运维的一体化轻量 AI 平台。
 
 > [!NOTE]
-> **本 fork（lij768423-svg/grok2api）开箱即用。** 基于官方最新，默认打开 `qualityGuard` + `requestRetry`：hold 30s、minOutput 8、密文 floor 256B / reasoning×4、burst（hold 过期短问候和 floor 达标秒吐仍扣）、假加密思考（无明文 reasoning、<2s 整段刷出）扣住、cipher-only 达 floor 后等 2s 再放行、TUI 续聊 / hosted tools 也 hold、缺思考 12h 冷却、空流 15m。Codex MCP `automation_update` / 根 `anyOf|oneOf` 会在转发前改成宽松 object。`docker compose up -d --build` 会带上质量守护 sidecar。不要 pull `ghcr.io/chenyme/grok2api:latest`（官方同参数但默认不拦截）。上游：[chenyme#1013](https://github.com/chenyme/grok2api/pull/1013) floor，[chenyme#1015](https://github.com/chenyme/grok2api/pull/1015) TUI hold — 不要带 fork 的 `enabled: true`。
+> **本 fork（lij768423-svg/grok2api）开箱即用。** 基于官方最新，默认打开 `qualityGuard` + `requestRetry`。当前 lab 版 **v3.1.7-lab**，详见下面「本次更新」。`docker compose up -d --build` 会带上质量守护 sidecar。不要 pull `ghcr.io/chenyme/grok2api:latest`（官方同参数但默认不拦截）。上游：[chenyme#1013](https://github.com/chenyme/grok2api/pull/1013) floor，[chenyme#1015](https://github.com/chenyme/grok2api/pull/1015) TUI hold — 不要带 fork 的 `enabled: true`。
+
+## 本次更新（v3.1.7-lab）
+
+相对 **v3.1.6-lab**。镜像：`ghcr.io/lij768423-svg/grok2api:v3.1.7-lab`、`ghcr.io/lij768423-svg/grok2api-quality-guard:v3.1.7-lab`（`latest` 已跟上）。
+
+v3.1.6 已经有：hold 30s、密文 floor 256B / reasoning×4、burst（hold 到期短「你好」、floor 刚过就秒吐短回复）、TUI 续聊 / hosted tools 也 hold、缺思考 12h、空流 15m。这次补的是线上漏掉的两类。
+
+### 1. 假加密思考拦截
+
+降智号会先塞一段看起来合法的 `encrypted_content` / `usage.reasoning_tokens`，闸门误以为「有思考」立刻放行，再把全文在一两秒内刷出来。v3.1.6 过不了这个。
+
+| 形态 | v3.1.6 | v3.1.7 |
+|---|---|---|
+| 短 stub `gAAAA-cipher`、hold 到期后的「你好」 | 扣住 | 扣住（没变） |
+| 密文刚过 floor 就立刻放行 | 放行 | **继续等**：可见文本流满 2s，或流结束 |
+| 无明文 reasoning，密文/账单像样，&lt;2s 整段刷出答案（18190 截图那种） | 放行 | **扣住换号** |
+| 密文过 floor、`reasoning_tokens=0`、可见文本狂刷（128k TUI drool） | 放行 | **扣住换号** |
+| 扣住时 usage 还是 0（空流 / 短 hold） | 按缺思考冷却（lab 1.5h） | **改走空流 15m**，避免一枪烧一串号 |
+
+有真正的明文 reasoning / summary delta 的，照旧立刻放行。
+
+### 2. Codex MCP schema 兼容
+
+Codex Desktop 会带自带 MCP `codex_app.automation_update`（上游名 `mcp__codex_app__automation_update`）。它的 JSON Schema 根是 `anyOf` / `oneOf` 且含非 object 分支，Grok Build 直接 `400 invalid-argument: tool parameter root must be an object type`。
+
+转发前只改这一类：
+
+- 名字对上 `codex_app.automation_update` / `codex_app__automation_update`：整段换成宽松 object（`additionalProperties: true`，`strict=false`）
+- 其它 function 如果根 `anyOf`/`oneOf` 里有非 object 分支（含 `$ref`、null）：同样换成宽松 object，避免整次请求被拒
+- **不动**：顶层同名 `automation_update`、别的 namespace、shell / apply_patch、嵌套字段里的 `anyOf`
+
+Claude CLI、普通 function 零变化。Codex 打 grok-4.6 能进上游；那个自动化 MCP 的严格 schema 没了，编码工具原样转发。
 
 ## 一键安装提示词
 
