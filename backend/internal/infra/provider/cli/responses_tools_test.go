@@ -300,20 +300,20 @@ func TestNormalizeResponsesRequestRemovesNullableFunctionParameterRoot(t *testin
 	}
 }
 
-func TestNormalizeResponsesRequestRejectsNullableNonObjectFunctionRoot(t *testing.T) {
-	_, _, err := normalizeResponsesRequest([]byte(`{
+func TestNormalizeResponsesRequestSimplifiesNullableNonObjectFunctionRoot(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
 		"model":"public","input":"hello",
 		"tools":[{"type":"function","name":"invalid","parameters":{
 			"anyOf":[{"type":"object"},{"type":"string"},{"type":"null"}]
 		}}]
 	}`), "grok-4.5")
-	requestErr, ok := err.(*responsesRequestError)
-	if !ok || requestErr.Param != "tools[0].parameters" || requestErr.Code != "invalid_parameter" {
-		t.Fatalf("error = %#v", err)
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertSimplifiedBuildFunctionParameters(t, normalized, compatibility, "invalid")
 }
 
-func TestNormalizeResponsesRequestRemovesNullableLocalRefFunctionRoot(t *testing.T) {
+func TestNormalizeResponsesRequestSimplifiesNullableLocalRefFunctionRoot(t *testing.T) {
 	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
 		"model":"public","input":"hello",
 		"tools":[{"type":"function","name":"lookup","parameters":{
@@ -328,21 +328,7 @@ func TestNormalizeResponsesRequestRemovesNullableLocalRefFunctionRoot(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "function_parameters_nullable_root_normalized") {
-		t.Fatalf("compatibility = %#v", compatibility)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(normalized, &payload); err != nil {
-		t.Fatal(err)
-	}
-	parameters := payload["tools"].([]any)[0].(map[string]any)["parameters"].(map[string]any)
-	if parameters["type"] != "object" {
-		t.Fatalf("upstream parameters = %#v", parameters)
-	}
-	branches := parameters["anyOf"].([]any)
-	if len(branches) != 1 || branches[0].(map[string]any)["$ref"] != "#/$defs/Args" {
-		t.Fatalf("upstream branches = %#v", branches)
-	}
+	assertSimplifiedBuildFunctionParameters(t, normalized, compatibility, "lookup")
 	visibleParameters := compatibility.visibleTools[0].(map[string]any)["parameters"].(map[string]any)
 	visibleBranches := visibleParameters["anyOf"].([]any)
 	if len(visibleBranches) != 2 || visibleParameters["type"] != nil {
@@ -350,8 +336,8 @@ func TestNormalizeResponsesRequestRemovesNullableLocalRefFunctionRoot(t *testing
 	}
 }
 
-func TestNormalizeResponsesRequestRejectsNullableExternalRefFunctionRoot(t *testing.T) {
-	_, _, err := normalizeResponsesRequest([]byte(`{
+func TestNormalizeResponsesRequestSimplifiesNullableExternalRefFunctionRoot(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
 		"model":"public","input":"hello",
 		"tools":[{"type":"function","name":"lookup","parameters":{
 			"anyOf":[
@@ -360,9 +346,99 @@ func TestNormalizeResponsesRequestRejectsNullableExternalRefFunctionRoot(t *test
 			]
 		}}]
 	}`), "grok-4.5")
-	requestErr, ok := err.(*responsesRequestError)
-	if !ok || requestErr.Param != "tools[0].parameters" || requestErr.Code != "invalid_parameter" {
-		t.Fatalf("error = %#v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSimplifiedBuildFunctionParameters(t, normalized, compatibility, "lookup")
+}
+
+func TestNormalizeResponsesRequestSimplifiesCodexAppAutomationUpdate(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"namespace","name":"codex_app","tools":[{
+			"type":"function","name":"automation_update","strict":true,
+			"parameters":{
+				"oneOf":[{"$ref":"#/$defs/Args"},{"type":"null"}],
+				"$defs":{"Args":{"type":"object","properties":{"title":{"type":"string"}}}}
+			}
+		},{"type":"function","name":"exec_command","strict":true,
+			"parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"],"additionalProperties":false}
+		}]}]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "function_parameters_simplified_for_build") {
+		t.Fatalf("compatibility = %#v", compatibility)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tools := payload["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools = %#v", tools)
+	}
+	auto := tools[0].(map[string]any)
+	if auto["name"] != "codex_app__automation_update" || auto["strict"] != false {
+		t.Fatalf("automation_update = %#v", auto)
+	}
+	parameters := auto["parameters"].(map[string]any)
+	if parameters["type"] != "object" || parameters["additionalProperties"] != true || parameters["oneOf"] != nil {
+		t.Fatalf("automation_update parameters = %#v", parameters)
+	}
+	if _, exists := parameters["properties"].(map[string]any)["title"]; exists {
+		t.Fatalf("automation_update schema was not replaced: %#v", parameters)
+	}
+	exec := tools[1].(map[string]any)
+	if exec["name"] != "codex_app__exec_command" || exec["strict"] != true {
+		t.Fatalf("exec_command = %#v", exec)
+	}
+	execParameters := exec["parameters"].(map[string]any)
+	if execParameters["additionalProperties"] != false || execParameters["properties"].(map[string]any)["cmd"] == nil {
+		t.Fatalf("exec_command parameters were rewritten: %#v", execParameters)
+	}
+}
+
+func TestNormalizeResponsesRequestKeepsTopLevelAutomationUpdateObjectSchema(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"function","name":"automation_update","strict":true,
+			"parameters":{"type":"object","properties":{"cron":{"type":"string"}},"required":["cron"],"additionalProperties":false}}]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatibility != nil && strings.Contains(compatibility.warningHeader(), "function_parameters_simplified_for_build") {
+		t.Fatalf("top-level automation_update should not be simplified: %#v", compatibility)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tool := payload["tools"].([]any)[0].(map[string]any)
+	parameters := tool["parameters"].(map[string]any)
+	if tool["strict"] != true || parameters["additionalProperties"] != false || parameters["properties"].(map[string]any)["cron"] == nil {
+		t.Fatalf("top-level automation_update was rewritten: %#v", tool)
+	}
+}
+
+func assertSimplifiedBuildFunctionParameters(t *testing.T, normalized []byte, compatibility *responsesToolCompatibility, wantName string) {
+	t.Helper()
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "function_parameters_simplified_for_build") {
+		t.Fatalf("compatibility = %#v", compatibility)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tool := payload["tools"].([]any)[0].(map[string]any)
+	if tool["name"] != wantName {
+		t.Fatalf("name = %#v, want %q", tool["name"], wantName)
+	}
+	parameters := tool["parameters"].(map[string]any)
+	if parameters["type"] != "object" || parameters["additionalProperties"] != true || parameters["anyOf"] != nil || parameters["oneOf"] != nil {
+		t.Fatalf("upstream parameters = %#v", parameters)
 	}
 }
 

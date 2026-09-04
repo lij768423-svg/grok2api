@@ -171,17 +171,7 @@ func (c *responsesToolCompatibility) normalizeTool(raw any, namespace string, cl
 			return nil, nil
 		}
 		converted := cloneJSONObject(tool)
-		if parameters, exists := converted["parameters"]; exists {
-			normalized, changed, normalizeErr := normalizeBuildFunctionParametersRoot(parameters, param+".parameters")
-			if normalizeErr != nil {
-				return nil, normalizeErr
-			}
-			if changed {
-				converted["parameters"] = normalized
-				c.changed = true
-				c.addWarning("function_parameters_nullable_root_normalized")
-			}
-		}
+		c.applyBuildFunctionParameterCompatibility(converted, name, namespace, param+".parameters")
 		identity := responsesToolIdentity{Kind: responsesFunctionTool, Namespace: namespace, Name: name}
 		alias := c.alias(identity)
 		if parameters, exists := tool["parameters"]; exists && schemaContainsInteger(parameters) {
@@ -271,6 +261,99 @@ func (c *responsesToolCompatibility) normalizeTool(raw any, namespace string, cl
 		}
 		return nil, unsupportedBuildToolError(kind, param)
 	}
+}
+
+const (
+	codexAppNamespaceName    = "codex_app"
+	automationUpdateToolName = "automation_update"
+)
+
+func (c *responsesToolCompatibility) applyBuildFunctionParameterCompatibility(converted map[string]any, name, namespace, param string) {
+	if parameters, exists := converted["parameters"]; exists {
+		normalized, changed, normalizeErr := normalizeBuildFunctionParametersRoot(parameters, param)
+		if normalizeErr != nil {
+			c.simplifyBuildFunctionParameters(converted)
+			return
+		}
+		if changed {
+			converted["parameters"] = normalized
+			c.changed = true
+			c.addWarning("function_parameters_nullable_root_normalized")
+		}
+	}
+	if buildFunctionParametersNeedSimplification(name, namespace, converted["parameters"]) {
+		c.simplifyBuildFunctionParameters(converted)
+	}
+}
+
+func (c *responsesToolCompatibility) simplifyBuildFunctionParameters(converted map[string]any) {
+	converted["parameters"] = safeBuildFunctionParameters()
+	if _, exists := converted["strict"]; exists {
+		converted["strict"] = false
+	}
+	c.changed = true
+	c.addWarning("function_parameters_simplified_for_build")
+}
+
+func safeBuildFunctionParameters() map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{},
+		"additionalProperties": true,
+	}
+}
+
+func isCodexAppAutomationUpdate(name, namespace string) bool {
+	name = strings.TrimSpace(name)
+	namespace = strings.TrimSpace(namespace)
+	qualified := codexAppNamespaceName + "__" + automationUpdateToolName
+	if strings.EqualFold(name, qualified) {
+		return true
+	}
+	return strings.EqualFold(namespace, codexAppNamespaceName) && strings.EqualFold(name, automationUpdateToolName)
+}
+
+func buildFunctionParametersNeedSimplification(name, namespace string, parameters any) bool {
+	if isCodexAppAutomationUpdate(name, namespace) {
+		return true
+	}
+	return schemaRootUnionNeedsSimplification(parameters)
+}
+
+func schemaRootUnionNeedsSimplification(value any) bool {
+	schema, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, keyword := range []string{"anyOf", "oneOf"} {
+		branches, ok := schema[keyword].([]any)
+		if !ok {
+			continue
+		}
+		for _, raw := range branches {
+			branch, ok := raw.(map[string]any)
+			if !ok || !schemaTypeIsObjectOnly(branch["type"]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func schemaTypeIsObjectOnly(rawType any) bool {
+	if rawType == "object" {
+		return true
+	}
+	types, ok := rawType.([]any)
+	if !ok || len(types) == 0 {
+		return false
+	}
+	for _, value := range types {
+		if value != "object" {
+			return false
+		}
+	}
+	return true
 }
 
 // normalizeBuildFunctionParametersRoot removes root-level nullability from function schemas.
