@@ -155,6 +155,9 @@ qualityGuard:
   # reasoning_tokens * encryptedBytesPerReasoningToken)。
   # stub + 足够可见输出在 hold 到期后扣住（TUI 30s 后的「你好」）。
   # floor 已达标但 1 秒内吐短回复的也扣。TUI 续聊 / hosted tools 仍 hold。
+  # 假加密思考：无明文 reasoning delta，密文/账单看起来合法，但可见文本
+  # 在 <2s 内整段刷出，扣住。cipher-only 达 floor 后不立刻放行，等可见
+  # 文本流满 2s 或流结束。reasoning_tokens=0 的 128k drool 也扣。
   # 3s hold 会把 grok-4.6 流末尾的 encrypted thinking 误判成 missing-thinking；
   # 30s 是校验上限，也是 lab 默认。
   requestRetry:

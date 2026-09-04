@@ -24,7 +24,7 @@
 > Check out [DEEIX-AI / DEEIX-Chat](https://github.com/DEEIX-AI/DEEIX-Chat), a lightweight, integrated AI platform for model routing, chat, files, tools, billing, identity, and operations.
 
 > [!NOTE]
-> **This fork (lij768423-svg/grok2api) is out of the box.** Official latest plus `qualityGuard` / `requestRetry` ON: 30s hold, minOutput 8, ciphertext floor 256B / reasoning×4, burst (hold-expired short greetings and floor-met dumps still withheld), TUI follow-ups / hosted tools held, 12h missing-thinking cooldown, 15m idle. `docker compose up -d --build` starts the sidecar. Do not pull `ghcr.io/chenyme/grok2api:latest` (same numbers, intercept off). Upstream: [chenyme#1013](https://github.com/chenyme/grok2api/pull/1013) floor, [chenyme#1015](https://github.com/chenyme/grok2api/pull/1015) TUI hold — do not include this fork's `enabled: true`.
+> **This fork (lij768423-svg/grok2api) is out of the box.** Official latest plus `qualityGuard` / `requestRetry` ON: 30s hold, minOutput 8, ciphertext floor 256B / reasoning×4, burst (hold-expired short greetings and floor-met dumps still withheld), fake-enc dumps (<2s full-answer flush with no plaintext reasoning) withheld, cipher-only thinking waits 2s before release, TUI follow-ups / hosted tools held, 12h missing-thinking cooldown, 15m idle. Codex MCP `automation_update` / root `anyOf|oneOf` schemas are simplified before Grok Build. `docker compose up -d --build` starts the sidecar. Do not pull `ghcr.io/chenyme/grok2api:latest` (same numbers, intercept off). Upstream: [chenyme#1013](https://github.com/chenyme/grok2api/pull/1013) floor, [chenyme#1015](https://github.com/chenyme/grok2api/pull/1015) TUI hold — do not include this fork's `enabled: true`.
 
 ## One-shot install prompt
 
@@ -41,6 +41,8 @@ This fork is out of the box: official latest + missing-thinking intercept ON.
 - hold 30s / minOutput 8 / 6 attempts / fail_closed
 - short encrypted_content stubs are not thinking; floor = max(256B, reasoning_tokens×4)
 - hold-expired short greeting + high reasoning still withheld
+- fake-enc dump (<2s full-answer flush, no plaintext reasoning) withheld; cipher-only waits 2s
+- Codex MCP root anyOf/oneOf schemas simplified for Grok Build
 - 12h missing-thinking cooldown, 15m idle; compose up -d starts the sidecar
 
 Use every residential sticky: one Mihomo listener + one Grok2API node per session.

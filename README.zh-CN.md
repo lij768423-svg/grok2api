@@ -24,7 +24,7 @@
 > 推荐个人新项目 [DEEIX-AI / DEEIX-Chat](https://github.com/DEEIX-AI/DEEIX-Chat)：面向多模型路由、对话、文件、工具、计费与运维的一体化轻量 AI 平台。
 
 > [!NOTE]
-> **本 fork（lij768423-svg/grok2api）开箱即用。** 基于官方最新，默认打开 `qualityGuard` + `requestRetry`：hold 30s、minOutput 8、密文 floor 256B / reasoning×4、burst（hold 过期短问候和 floor 达标秒吐仍扣）、TUI 续聊 / hosted tools 也 hold、缺思考 12h 冷却、空流 15m。`docker compose up -d --build` 会带上质量守护 sidecar。不要 pull `ghcr.io/chenyme/grok2api:latest`（官方同参数但默认不拦截）。上游：[chenyme#1013](https://github.com/chenyme/grok2api/pull/1013) floor，[chenyme#1015](https://github.com/chenyme/grok2api/pull/1015) TUI hold — 不要带 fork 的 `enabled: true`。
+> **本 fork（lij768423-svg/grok2api）开箱即用。** 基于官方最新，默认打开 `qualityGuard` + `requestRetry`：hold 30s、minOutput 8、密文 floor 256B / reasoning×4、burst（hold 过期短问候和 floor 达标秒吐仍扣）、假加密思考（无明文 reasoning、<2s 整段刷出）扣住、cipher-only 达 floor 后等 2s 再放行、TUI 续聊 / hosted tools 也 hold、缺思考 12h 冷却、空流 15m。Codex MCP `automation_update` / 根 `anyOf|oneOf` 会在转发前改成宽松 object。`docker compose up -d --build` 会带上质量守护 sidecar。不要 pull `ghcr.io/chenyme/grok2api:latest`（官方同参数但默认不拦截）。上游：[chenyme#1013](https://github.com/chenyme/grok2api/pull/1013) floor，[chenyme#1015](https://github.com/chenyme/grok2api/pull/1015) TUI hold — 不要带 fork 的 `enabled: true`。
 
 ## 一键安装提示词
 
@@ -41,6 +41,8 @@ https://github.com/lij768423-svg/grok2api/blob/main/AI_GROK2API_INSTALL.md
 - hold 30s / minOutput 8 / 6 枪 / fail_closed
 - 短 encrypted_content stub 不算思考；floor = max(256B, reasoning_tokens×4)
 - hold 到期后的短问候 + 高 reasoning（「你好」）继续扣
+- 假加密思考（无明文 reasoning、<2s 整段刷出）扣住；cipher-only 等 2s
+- Codex MCP 根 anyOf/oneOf schema 转发前改成宽松 object
 - 缺思考冷却 12h，空流 15m；docker compose up -d 带 sidecar
 
 家宽全部用上，每个 sticky 一个 Mihomo listener + 一个 Grok2API 节点。

@@ -88,7 +88,7 @@ http://ACCOUNT-region-US-sid-XXXX-t-10:PASS@HOST:PORT
 5. 禁止：Grok2API 在 bridge 网络里填 `http://127.0.0.1:端口`（那是容器自己）。用 `network_mode: host`，或 `host.docker.internal` / 宿主机网关。
 6. 注册口和使用口不要抢同一条 sticky。脚本会在 N≥4 时自动拆。
 7. 不要把 CPA `.so`、8317、商店插件写进交付说明。
-8. 不要 `docker pull ghcr.io/chenyme/grok2api:latest`。官方镜像 **默认不拦截**，也没有本 fork 的密文 floor / burst。必须 `--build` 本仓库。
+8. 不要 `docker pull ghcr.io/chenyme/grok2api:latest`。官方镜像 **默认不拦截**，也没有本 fork 的密文 floor / burst / 假加密思考拦截。必须 `--build` 本仓库。
 
 ---
 
@@ -243,7 +243,7 @@ python3 ~/grok-fullchain/deploy/import_to_grok2api.py \
 | --- | --- |
 | Grok2API | URL（常见 `:8000` / `:8181`） |
 | Guard | `/quality-guard`；mode / failClosed / softTPS |
-| 拦截 | requestRetry 开；hold 30s；floor 256B / ×4；burst 开 |
+| 拦截 | requestRetry 开；hold 30s；floor 256B / ×4；burst / 假加密 dump / cipher-drool 开 |
 | 家宽 | 用户贴了 N 条 → 使用侧 x 个 + 注册侧 y 个 |
 | 出口 IP | 端口 → IP；标出重复 IP |
 | 像不像 lab | 使用侧 ≥3 且 Guard 已按本文打开 = 接近；否则写原因 |

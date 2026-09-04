@@ -1,13 +1,13 @@
 name: grok2api
 
-# Lab 默认：qualityGuard + requestRetry 已开（密文 floor / burst / hold 30s），sidecar 随 `up -d` 启动。
+# Lab 默认：qualityGuard + requestRetry 已开（密文 floor / burst / 假加密 dump / hold 30s），sidecar 随 `up -d` 启动。
 # 不要 pull ghcr.io/chenyme/grok2api:latest（官方默认不拦截）。首次请 --build。
 # 首次：./scripts/bootstrap-lab-config.sh 或 cp config.example.yaml config.yaml ，改 secrets 和 bootstrapAdmin。
 
 services:
   grok2api:
     container_name: grok2api
-    image: "${GROK2API_IMAGE:-ghcr.io/lij768423-svg/grok2api:v3.1.6-lab}"
+    image: "${GROK2API_IMAGE:-ghcr.io/lij768423-svg/grok2api:v3.1.7-lab}"
     build:
       context: .
       dockerfile: Dockerfile
@@ -65,7 +65,7 @@ services:
   # 出口质量守护：默认随主服务启动（passive，不额外烧 token）。
   egress-quality-guard:
     container_name: grok2api-egress-quality-guard
-    image: "${GROK2API_QG_IMAGE:-ghcr.io/lij768423-svg/grok2api-quality-guard:v3.1.6-lab}"
+    image: "${GROK2API_QG_IMAGE:-ghcr.io/lij768423-svg/grok2api-quality-guard:v3.1.7-lab}"
     build:
       context: .
       dockerfile: tools/egress-quality-guard/Dockerfile
