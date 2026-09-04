@@ -28,9 +28,18 @@ const (
 	defaultBurstFlushMS                    = int64(1000)
 	defaultBurstMaxVisible                 = int64(32)
 	defaultBurstMinReasoning               = int64(80)
-	defaultMissingThinkingCooldown         = 12 * time.Hour
-	lastErrorMissingThinking               = accountdomain.LastErrorMissingThinking
-	lastErrorMissingThinkingDisabled       = accountdomain.LastErrorMissingThinkingDisabled
+	// Fake encrypted thinking dumps the whole visible answer after a long
+	// wait. Audit TPS is rewritten against full duration (looks like 60–120
+	// tok/s) but first-token ≈ duration. Catch flush windows up to 2s so
+	// 1.8s / 1962-token dumps are withheld too.
+	defaultFakeEncFlushMS = int64(2000)
+	// Cipher-only "thinking" that is already dumping this much visible text
+	// with usage.reasoning_tokens=0 is the 128k status-loop drool, not a
+	// real encrypted thinking stream.
+	defaultCipherDroolVisible        = int64(1024)
+	defaultMissingThinkingCooldown   = 12 * time.Hour
+	lastErrorMissingThinking         = accountdomain.LastErrorMissingThinking
+	lastErrorMissingThinkingDisabled = accountdomain.LastErrorMissingThinkingDisabled
 	// An empty stream that idles while held is treated as an account-quality
 	// failure: the request can still rotate before any bytes reach the client.
 	qualityIdleAccountCooldown = 15 * time.Minute
@@ -61,6 +70,9 @@ type QualityRetryRuntime struct {
 // directly and via ObserveQualityChunk on SSE fixtures.
 type QualityStreamSignals struct {
 	HasThinking bool
+	// PlaintextThinking is reasoning_text / summary deltas. Encrypted
+	// ciphertext can set HasThinking without this bit.
+	PlaintextThinking bool
 	// ReasoningStarted is an empty reasoning item or the Chat SSE stub
 	// `: grok2api-reasoning-start`. That is not proof of thinking: 降智
 	// still emits the stub, then dumps visible tokens with usage 0.
@@ -155,6 +167,9 @@ func encryptedThinkingFloor(minBytes, bytesPerToken int, reasoningTokens int64) 
 }
 
 func qualityIsBurstDump(sig QualityStreamSignals, minOutput int64) bool {
+	if sig.PlaintextThinking {
+		return false
+	}
 	visible := sig.VisibleTokens
 	floor := encryptedThinkingFloor(0, 0, sig.ReasoningTokens)
 	barelyCipher := sig.EncryptedBytes > 0 && sig.EncryptedBytes < floor*2
@@ -177,31 +192,75 @@ func qualityIsBurstDump(sig QualityStreamSignals, minOutput int64) bool {
 	return false
 }
 
+// qualityIsFakeEncryptedDump is the 18190 screenshot pattern: no plaintext
+// reasoning deltas, ciphertext / usage.reasoning_tokens look legitimate,
+// then the whole answer arrives in a short flush (first-token ≈ duration).
+func qualityIsFakeEncryptedDump(sig QualityStreamSignals, minOutput int64) bool {
+	if sig.PlaintextThinking {
+		return false
+	}
+	if minOutput <= 0 {
+		minOutput = defaultQualityMinOutput
+	}
+	if sig.VisibleTokens < minOutput {
+		return false
+	}
+	flushed := sig.FirstVisible && sig.VisibleFlushMS >= 0 && sig.VisibleFlushMS < defaultFakeEncFlushMS
+	if !flushed {
+		return false
+	}
+	if sig.ReasoningTokens >= defaultBurstMinReasoning || sig.EncryptedBytes >= defaultMinEncryptedBytes {
+		return true
+	}
+	return false
+}
+
+// qualityIsCipherDrool is the 128k TUI status-loop: ciphertext met the
+// floor so HasThinking is true, but there is no plaintext reasoning and
+// usage.reasoning_tokens is still 0 while visible text is already dumping.
+func qualityIsCipherDrool(sig QualityStreamSignals, minOutput int64) bool {
+	if minOutput <= 0 {
+		minOutput = defaultQualityMinOutput
+	}
+	if sig.PlaintextThinking || sig.ReasoningTokens > 0 {
+		return false
+	}
+	if sig.EncryptedBytes <= 0 {
+		return false
+	}
+	visible := sig.VisibleTokens
+	if visible >= defaultCipherDroolVisible {
+		return true
+	}
+	if sig.Terminal && visible >= minOutput {
+		return true
+	}
+	return false
+}
+
 // ClassifyQualityHold decides whether a held stream may be forwarded.
-// Streamed thinking delivers: reasoning/summary deltas, or a reasoning item
-// whose encrypted_content meets the ciphertext floor. A non-empty stub such
-// as "gAAAA-cipher" is not thinking. Usage.reasoning_tokens alone does not —
-// degraded upstreams fill that field without ciphertext or deltas. A finished
-// sample with enough visible output and no streamed thinking is withheld.
-// Short replies below minOutput are delivered so "ok"/"yes" is not retried.
-// A hold timeout with no visible output is not fail-open: keep waiting for
-// more bytes or a stream abort so an empty hang is not flushed as HTTP 200.
-//
-// An empty reasoning stub is not thinking. Before the hold deadline, wait for
-// real evidence or a terminal event. A stub plus enough visible output at the
-// deadline is withheld — that is the TUI dump after 30s, not late ciphertext.
-// Stub-only empty streams keep waiting for idle/terminal handling.
-// HasThinking that is only a thin ciphertext dump after the hold (or a
-// barely-over-floor flush in <1s) is still withheld.
 func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdict {
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
 	if sig.HasThinking {
-		if qualityIsBurstDump(sig, minOutput) {
+		if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) {
 			return QualityWithhold
 		}
-		return QualityDeliver
+		if sig.PlaintextThinking {
+			return QualityDeliver
+		}
+		// Cipher-only: do not release when encrypted_content first meets
+		// the floor. Fake dumps send the blob, then the whole answer in
+		// <2s; releasing early lets that dump bypass fake-enc. Wait until
+		// visible text has streamed for 2s, or the stream ends.
+		if sig.Terminal {
+			return QualityDeliver
+		}
+		if sig.VisibleTokens >= minOutput && sig.FirstVisible && sig.VisibleFlushMS >= defaultFakeEncFlushMS {
+			return QualityDeliver
+		}
+		return QualityWait
 	}
 	// Prefer observed/derived visible output. Total output includes reasoning
 	// tokens, which are deliberately not trusted as quality evidence above. If

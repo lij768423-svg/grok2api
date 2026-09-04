@@ -160,16 +160,17 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		flushMS = time.Since(s.firstVisibleAt).Milliseconds()
 	}
 	return QualityStreamSignals{
-		HasThinking:      hasThinking,
-		ReasoningStarted: s.reasoningStarted || hasThinking,
-		VisibleTokens:    visible,
-		ReasoningTokens:  reasoningTokens,
-		OutputTokens:     output,
-		EncryptedBytes:   s.encryptedBytes,
-		FirstVisible:     firstVisible,
-		VisibleFlushMS:   flushMS,
-		Terminal:         s.terminal,
-		HoldExpired:      s.holdExpired,
+		HasThinking:       hasThinking,
+		PlaintextThinking: s.hasThinking,
+		ReasoningStarted:  s.reasoningStarted || hasThinking,
+		VisibleTokens:     visible,
+		ReasoningTokens:   reasoningTokens,
+		OutputTokens:      output,
+		EncryptedBytes:    s.encryptedBytes,
+		FirstVisible:      firstVisible,
+		VisibleFlushMS:    flushMS,
+		Terminal:          s.terminal,
+		HoldExpired:       s.holdExpired,
 	}
 }
 
@@ -532,7 +533,13 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 			if len(result.data) > 0 {
 				if held.Len()+len(result.data) > qualityHoldMaxBufferBytes {
 					_, _ = held.Write(result.data)
-					return newPrefixReplay(&held, pump), QualityDeliver, state.usage, state.responseID, nil
+					ObserveQualityChunk(&state, result.data)
+					state.holdExpired = true
+					verdict := ClassifyQualityHold(state.signals(), cfg.MinOutputTokens)
+					if verdict == QualityWait {
+						verdict = QualityWithhold
+					}
+					return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
 				}
 				_, _ = held.Write(result.data)
 				ObserveQualityChunk(&state, result.data)

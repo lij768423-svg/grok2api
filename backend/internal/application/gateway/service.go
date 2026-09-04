@@ -1625,7 +1625,18 @@ attemptLoop:
 				}
 				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
 				if verdict == QualityWithhold {
-					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown)
+					cooldown := holdCfg.AccountCooldown
+					// Usage not reported yet (logged as output_tokens=0) is the
+					// empty/short-hold path, not a confirmed 128k missing-thinking
+					// dump. Use idle cooldown so one TUI turn does not 1.5h-burn
+					// five accounts.
+					if peekUsage.OutputTokens == 0 && peekUsage.ReasoningTokens == 0 {
+						cooldown = holdCfg.IdleAccountCooldown
+						if cooldown <= 0 {
+							cooldown = qualityIdleAccountCooldown
+						}
+					}
+					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, cooldown)
 				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
