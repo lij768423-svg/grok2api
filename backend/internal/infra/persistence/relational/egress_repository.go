@@ -280,12 +280,13 @@ func (r *EgressRepository) UpdateEgressNodeProbe(ctx context.Context, id uint64,
 		"ipv6_probe_latency_ms": value.IPv6.LatencyMS, "ipv6_exit_ip": value.IPv6.ExitIP, "ipv6_probe_error": value.IPv6.Error,
 		"updated_at": time.Now().UTC(),
 	}
-	if value.Status == egress.ProbeStatusHealthy {
+	clearedHealth, clearedFailures, _, clearedError := egress.ApplyHealthyProbe(value.Status, 1, 0, nil, egress.LastErrorTransport)
+	if clearedError == "" && clearedFailures == 0 {
 		condition := "last_error = ?"
-		updates["health"] = gorm.Expr("CASE WHEN "+condition+" THEN ? ELSE health END", egress.LastErrorTransport, 1)
-		updates["failure_count"] = gorm.Expr("CASE WHEN "+condition+" THEN ? ELSE failure_count END", egress.LastErrorTransport, 0)
+		updates["health"] = gorm.Expr("CASE WHEN "+condition+" THEN ? ELSE health END", egress.LastErrorTransport, clearedHealth)
+		updates["failure_count"] = gorm.Expr("CASE WHEN "+condition+" THEN ? ELSE failure_count END", egress.LastErrorTransport, clearedFailures)
 		updates["cooldown_until"] = gorm.Expr("CASE WHEN "+condition+" THEN NULL ELSE cooldown_until END", egress.LastErrorTransport)
-		updates["last_error"] = gorm.Expr("CASE WHEN "+condition+" THEN ? ELSE last_error END", egress.LastErrorTransport, "")
+		updates["last_error"] = gorm.Expr("CASE WHEN "+condition+" THEN ? ELSE last_error END", egress.LastErrorTransport, clearedError)
 	}
 	result := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).
 		Where("id = ? AND encrypted_proxy_url = ?", id, expectedEncryptedProxyURL).

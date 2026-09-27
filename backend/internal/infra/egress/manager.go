@@ -1710,8 +1710,7 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 		}
 		value.FailureCount++
 		value.Health = max(0.05, value.Health*0.7)
-		cooldown := min(10*time.Minute, 30*time.Second*time.Duration(1<<min(value.FailureCount-1, 4)))
-		until := now.Add(cooldown)
+		until := now.Add(domain.TransportCooldownDuration(value.FailureCount))
 		value.CooldownUntil = &until
 		value.LastError = domain.LastErrorTransport
 		m.clientMu.Lock()

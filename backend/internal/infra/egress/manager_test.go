@@ -1566,9 +1566,14 @@ func TestFixedProxyTransportFailureStillCreatesCooldown(t *testing.T) {
 	}
 	repository := &mutableEgressRepository{node: domain.Node{ID: 1, Name: "fixed", Scope: domain.ScopeBuild, Enabled: true, Health: 1}}
 	manager := NewManager(repository, cipher)
+	before := time.Now().UTC()
 	manager.FeedbackForScope(context.Background(), domain.ScopeBuild, 1, 0, errors.New("connection refused"))
 	if repository.updates != 1 || repository.node.FailureCount != 1 || repository.node.CooldownUntil == nil || repository.node.LastError != "transport error" {
 		t.Fatalf("fixed transport failure did not create cooldown: updates=%d node=%#v", repository.updates, repository.node)
+	}
+	window := repository.node.CooldownUntil.Sub(before)
+	if window <= 0 || window > domain.SingleTransportCooldown+time.Second {
+		t.Fatalf("single transport cooldown = %s, want <= %s", window, domain.SingleTransportCooldown)
 	}
 }
 
