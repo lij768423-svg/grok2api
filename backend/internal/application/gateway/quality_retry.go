@@ -288,6 +288,14 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if output <= 0 {
 		output = sig.OutputTokens
 	}
+	// VisibleTokens stays stream-only so burst detection still sees a short
+	// greeting. With no thinking evidence, though, a short visible answer
+	// billed far more completion than reasoning still generated output we
+	// never saw: judge "enough" on that billed remainder too (lab 18183 chat
+	// rows with reasoning_tokens=0 rose after visible stopped lifting usage).
+	if billed := sig.OutputTokens - sig.ReasoningTokens; billed > output {
+		output = billed
+	}
 	enough := output >= minOutput
 	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
 		return QualityWait
