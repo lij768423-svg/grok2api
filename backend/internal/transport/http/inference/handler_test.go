@@ -1701,6 +1701,24 @@ func TestReferenceToVideoRequestValidation(t *testing.T) {
 		t.Fatalf("valid r2v status=%d body=%s", validRec.Code, validRec.Body.String())
 	}
 }
+func TestStartStreamPreludeFlushesCommentImmediately(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	stop := startStreamPrelude(ctx)
+	stop()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), ": open\n") {
+		t.Fatalf("body = %q", recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("content-type = %q", got)
+	}
+}
+
 func TestEditAndExtendVideoRequestValidation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler := &Handler{maxBodyBytes: 1 << 20}

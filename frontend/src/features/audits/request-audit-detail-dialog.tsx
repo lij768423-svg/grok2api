@@ -417,7 +417,9 @@ function AttemptSummary({ attempt }: { attempt: AuditAttemptDTO }) {
   const isHTTP = attempt.source === "upstream_http";
   const isStreamFailure = isHTTP && attempt.stage === "response_stream";
   const Icon = isHTTP ? Server : attempt.source === "gateway_transport" ? Network : KeyRound;
-  const title = isStreamFailure
+  const title = attempt.stage === "request_canceled"
+    ? t("audits.requestCanceled")
+    : isStreamFailure
     ? t("audits.upstreamStreamFailure", { status: attempt.upstreamStatusCode ?? "-" })
     : isHTTP
     ? t("audits.upstreamHttpFailure", { status: attempt.upstreamStatusCode ?? "-" })

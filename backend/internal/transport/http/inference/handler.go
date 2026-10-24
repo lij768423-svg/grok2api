@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -320,6 +321,10 @@ func (h *Handler) createChatCompletion(c *gin.Context) {
 	}
 	requestID, _ := c.Get(middleware.RequestIDKey)
 	requestIDValue, _ := requestID.(string)
+	stopPrelude := func() {}
+	if request.Stream {
+		stopPrelude = startStreamPrelude(c)
+	}
 	result, err := h.gateway.CreateChatCompletion(c.Request.Context(), gateway.Input{
 		RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model,
 		Body: body, Streaming: request.Stream, PromptCacheKey: request.PromptCacheKey,
@@ -330,6 +335,7 @@ func (h *Handler) createChatCompletion(c *gin.Context) {
 		Path:                      c.Request.URL.Path,
 		Headers:                   c.Request.Header.Clone(),
 	})
+	stopPrelude()
 	if err != nil {
 		writeGatewayError(c, err)
 		return
@@ -1163,17 +1169,54 @@ func (h *Handler) handleCreate(c *gin.Context, compact bool) {
 		Path:                      c.Request.URL.Path,
 		Headers:                   c.Request.Header.Clone(),
 	}
+	stopPrelude := func() {}
+	if request.Stream && !compact {
+		stopPrelude = startStreamPrelude(c)
+	}
 	var result *gateway.Result
 	if compact {
 		result, err = h.gateway.CompactResponse(c.Request.Context(), input)
 	} else {
 		result, err = h.gateway.CreateResponse(c.Request.Context(), input)
 	}
+	stopPrelude()
 	if err != nil {
 		writeGatewayError(c, err)
 		return
 	}
 	h.writeResponsesResult(c, result, request.Stream && !compact, request.Model)
+}
+
+// startStreamPrelude writes the streaming status immediately and keeps the
+// connection alive while the upstream dial is still in progress. Clients and
+// proxies that abort a silent socket at about five seconds otherwise cancel
+// the request before cli-chat-proxy returns headers.
+func startStreamPrelude(c *gin.Context) func() {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+	_, _ = c.Writer.WriteString(": open\n\n")
+	c.Writer.Flush()
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-c.Request.Context().Done():
+				return
+			case <-ticker.C:
+				_, _ = c.Writer.WriteString(": ping\n\n")
+				c.Writer.Flush()
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(done) }) }
 }
 
 func isJSONRequest(c *gin.Context) bool {
@@ -2282,7 +2325,26 @@ func writeGatewayError(c *gin.Context, err error) {
 		status, code = http.StatusServiceUnavailable, "upstream_unavailable"
 		message = "当前没有可用的上游账号"
 	}
+	if c.Writer.Written() {
+		writeStreamError(c, code, message)
+		c.Abort()
+		return
+	}
 	writeOpenAIError(c, status, code, message)
+}
+
+func writeStreamError(c *gin.Context, code, message string) {
+	payload, err := json.Marshal(map[string]any{
+		"type":  "error",
+		"error": map[string]any{"message": message, "code": code},
+	})
+	if err != nil {
+		return
+	}
+	_, _ = c.Writer.Write([]byte("data: "))
+	_, _ = c.Writer.Write(payload)
+	_, _ = c.Writer.Write([]byte("\n\n"))
+	c.Writer.Flush()
 }
 
 func writeGatewayAnthropicError(c *gin.Context, err error) {
