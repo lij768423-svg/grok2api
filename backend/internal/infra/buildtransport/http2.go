@@ -33,3 +33,17 @@ func ConfigureHTTP2Health(transport *http.Transport) (*http2.Transport, error) {
 	h2.PingTimeout = HTTP2PingTimeout
 	return h2, nil
 }
+
+// HTTP2HealthConfigured reports whether ConfigureHTTP2Health has installed the
+// x/net HTTP/2 transport on transport. x/net registers it through TLSNextProto
+// on Go < 1.27 and through Transport.Protocols on Go >= 1.27, so callers and
+// tests must go through this helper instead of inspecting either field.
+func HTTP2HealthConfigured(transport *http.Transport) bool {
+	if transport == nil {
+		return false
+	}
+	if transport.TLSNextProto != nil && transport.TLSNextProto["h2"] != nil {
+		return true
+	}
+	return transport.Protocols != nil && transport.Protocols.HTTP2()
+}

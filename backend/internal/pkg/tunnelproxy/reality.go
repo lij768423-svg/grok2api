@@ -107,7 +107,7 @@ func (p *realityProxy) handshake(ctx context.Context, connection net.Conn) (net.
 		return nil, err
 	}
 	hello := secure.HandshakeState.Hello
-	privateKey := secure.HandshakeState.State13.EcdheKey
+	privateKey := realityX25519Key(secure.HandshakeState.State13)
 
 	hello.SessionId = make([]byte, 32)
 	copy(hello.Raw[39:], hello.SessionId)
@@ -177,11 +177,29 @@ func buildRealityClientHello(connection net.Conn, serverName string, alpn []stri
 		config.NextProtos = append([]string(nil), alpn...)
 		secure.HandshakeState.Hello.AlpnProtocols = append([]string(nil), alpn...)
 	}
-	privateKey := secure.HandshakeState.State13.EcdheKey
+	privateKey := realityX25519Key(secure.HandshakeState.State13)
 	if privateKey == nil || privateKey.Curve() != ecdh.X25519() {
 		return nil, fmt.Errorf("Reality 客户端指纹 %q 未提供 X25519 TLS 1.3 key share", helloID.Client)
 	}
 	return secure, nil
+}
+
+// realityX25519Key returns the client's X25519 TLS 1.3 key share private key.
+// utls < 1.8 exposed it as State13.EcdheKey; utls >= 1.8 moved it into
+// State13.KeyShareKeys, where a hybrid X25519MLKEM768 share keeps its X25519
+// half in MlkemEcdhe. REALITY only needs the X25519 half, and Go reuses the
+// same X25519 key for the pure and hybrid shares, so either field works.
+func realityX25519Key(state utls.TLS13OnlyState) *ecdh.PrivateKey {
+	candidates := []*ecdh.PrivateKey{state.EcdheKey}
+	if state.KeyShareKeys != nil {
+		candidates = append(candidates, state.KeyShareKeys.Ecdhe, state.KeyShareKeys.MlkemEcdhe)
+	}
+	for _, key := range candidates {
+		if key != nil && key.Curve() == ecdh.X25519() {
+			return key
+		}
+	}
+	return nil
 }
 
 func realityPrefersAESGCM(cipherSuites []uint16) bool {
